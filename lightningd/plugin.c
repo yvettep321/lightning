@@ -1,6 +1,7 @@
 #include "lightningd/plugin.h"
 
 #include <ccan/list/list.h>
+#include <ccan/pipecmd/pipecmd.h>
 #include <ccan/tal/str/str.h>
 #include <lightningd/json.h>
 #include <unistd.h>
@@ -33,6 +34,12 @@ void plugin_register(struct plugins *plugins, const char* path TAKES)
 
 void plugins_init(struct plugins *plugins)
 {
+	struct plugin *p;
+	/* Spawn the plugin processes before entering the io_loop */
+	for (size_t i=0; i<tal_count(plugins->plugins); i++) {
+		p = &plugins->plugins[i];
+		p->pid = pipecmd(&p->stdout, &p->stdin, NULL, p->cmd);
+	}
 }
 
 void json_add_opt_plugins(struct json_stream *response,
