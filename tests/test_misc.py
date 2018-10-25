@@ -863,7 +863,7 @@ def test_ipv4_and_ipv6(node_factory):
         assert bind[0]['address'] == '0.0.0.0'
         assert int(bind[0]['port']) == port
 
-
+@pytest.skipIf(not DEVELOPER, "If not in developer-mode we snap to feerate-floor in testnets")
 def test_feerates(node_factory):
     l1 = node_factory.get_node(options={'log-level': 'io'}, start=False)
     l1.daemon.rpcproxy.mock_rpc('estimatesmartfee', {
