@@ -971,6 +971,33 @@ static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
 	json_object_end(s);
 }
 
+static void
+htlc_accepted_hook_try_resolve(struct htlc_accepted_hook_payload *request,
+			       struct preimage *payment_preimage)
+{
+	struct sha256 payment_hash;
+	struct htlc_in *hin = request->hin;
+	u8 *unknown_details;
+	/* Verify that the provided secret hashes to what we need. */
+	sha256(&payment_hash, payment_preimage, sizeof(struct preimage));
+
+	if (!sha256_eq(&payment_hash, &hin->payment_hash)) {
+		log_broken(
+		    request->channel->log,
+		    "Plugin returned a preimage (sha256(%s) = %s) that doesn't "
+		    "match the HTLC hash (%s) it tries to resolve.",
+		    type_to_string(tmpctx, struct preimage, payment_preimage),
+		    type_to_string(tmpctx, struct sha256, &payment_hash),
+		    type_to_string(tmpctx, struct sha256, &hin->payment_hash));
+
+		unknown_details = tal_arr(NULL, u8, 0);
+		towire_u16(&unknown_details, 0x400f);
+		local_fail_in_htlc(hin, take(unknown_details));
+	} else {
+		fulfill_htlc(hin, payment_preimage);
+	}
+}
+
 /**
  * Callback when a plugin answers to the htlc_accepted hook
  */
@@ -1017,10 +1044,9 @@ htlc_accepted_hook_callback(struct htlc_accepted_hook_payload *request,
 		local_fail_in_htlc(hin, take(failmsg));
 		break;
 	case htlc_accepted_resolve:
-		fulfill_htlc(hin, &payment_preimage);
+		htlc_accepted_hook_try_resolve(request, &payment_preimage);
 		break;
 	}
-
 	tal_free(request);
 }
 
