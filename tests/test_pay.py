@@ -2942,3 +2942,28 @@ def test_sendpay_blinding(node_factory):
                    payment_hash=inv['payment_hash'],
                    bolt11=inv['bolt11'])
     l1.rpc.waitsendpay(inv['payment_hash'])
+
+
+def test_keysend(node_factory):
+    # Use a temporary python plugin until we implement a native one
+    plugin_path = os.path.join(os.getcwd(), 'tests/plugins/keysend.py')
+    opts = {'plugin': plugin_path}
+    amt = 10000
+    l1, l2, l3 = node_factory.line_graph(3, opts=opts, wait_for_announce=True)
+
+    # Send an indirect one from l1 to l3
+    l1.rpc.keysend(l3.info['id'], amt)
+    invs = l3.rpc.listinvoices()['invoices']
+    assert(len(invs) == 1)
+
+    inv = invs[0]
+    print(inv)
+    assert(inv['msatoshi_received'] >= amt)
+
+    # Now send a direct one instead from l1 to l2
+    l1.rpc.keysend(l2.info['id'], amt)
+    invs = l2.rpc.listinvoices()['invoices']
+    assert(len(invs) == 1)
+
+    inv = invs[0]
+    assert(inv['msatoshi_received'] >= amt)
