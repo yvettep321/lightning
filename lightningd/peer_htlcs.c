@@ -870,6 +870,11 @@ htlc_accepted_hook_deserialize(const tal_t *ctx,
 			      " hook: %.*s",
 			      payloadtok->end - payloadtok->start,
 			      buffer + payloadtok->start);
+		if (tal_bytelen(*payload) < 2)
+			fatal("Too short payload for htlc_accepted"
+			      " hook: %.*s",
+			      payloadtok->end - payloadtok->start,
+			      buffer + payloadtok->start);
 	} else
 		*payload = NULL;
 
@@ -1011,6 +1016,18 @@ htlc_accepted_hook_try_resolve(struct htlc_accepted_hook_payload *request,
 	}
 }
 
+static u8 *prepend_length(const tal_t *ctx, const u8 *payload)
+{
+	u8 buf[BIGSIZE_MAX_LEN], *ret;
+	size_t len;
+
+	len = bigsize_put(buf, tal_bytelen(payload));
+	ret = tal_arr(ctx, u8, len + tal_bytelen(payload));
+	memcpy(ret, buf, len);
+	memcpy(ret + len, payload, tal_bytelen(payload));
+	return ret;
+}
+
 /**
  * Callback when a plugin answers to the htlc_accepted hook
  */
@@ -1033,9 +1050,11 @@ htlc_accepted_hook_callback(struct htlc_accepted_hook_payload *request,
 
 	/* If we have a replacement payload, parse it now. */
 	if (payload) {
+		/* To distinguish legacy and non-legacy, we always prepend length
+		 * to tlv-style payloads */
 		tal_free(request->payload);
 		tal_free(rs->raw_payload);
-		rs->raw_payload = tal_steal(rs, payload);
+		rs->raw_payload = prepend_length(rs, payload);
 		request->payload = onion_decode(request, rs,
 						hin->blinding, &hin->blinding_ss,
 						&request->failtlvtype,
