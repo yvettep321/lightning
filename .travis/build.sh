@@ -38,7 +38,8 @@ pip3 install --user -U --quiet --progress-bar off \
      -r requirements.txt \
      -r contrib/pyln-client/requirements.txt \
      -r contrib/pyln-proto/requirements.txt \
-     -r contrib/pyln-testing/requirements.txt
+     -r contrib/pyln-testing/requirements.txt \
+     pytest-repeat
 
 echo "Configuration which is going to be built:"
 echo -en 'travis_fold:start:script.1\\r'
