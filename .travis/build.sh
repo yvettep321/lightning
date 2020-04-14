@@ -101,7 +101,9 @@ elif [ "$SOURCE_CHECK_ONLY" == "false" ]; then
     echo -en 'travis_fold:end:script.2\\r'
 
     echo -en 'travis_fold:start:script.3\\r'
-    make -j$PYTEST_PAR check
+    make -j$PYTEST_PAR default
+
+    pytest -vvv -n $PYTEST_PAR --count=50 -k test_replacement_payload
     echo -en 'travis_fold:end:script.3\\r'
 else
     git clone https://github.com/lightningnetwork/lightning-rfc.git
