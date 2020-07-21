@@ -2460,8 +2460,7 @@ static void presplit_cb(struct presplit_mod_data *d, struct payment *p)
 			return payment_fail(
 			    p, "Cannot attempt payment, we have no channel to "
 			       "which we can add an HTLC");
-		}  else if (p->amount.millisatoshis / MPP_TARGET_SIZE >
-			   htlcs) /* Raw: division */
+		}  else if (p->amount.millisatoshis / MPP_TARGET_SIZE > htlcs) /* Raw: division */
 			target.millisatoshis = p->amount.millisatoshis / htlcs; /* Raw: division */
 
 		/* If we are already below the target size don't split it
