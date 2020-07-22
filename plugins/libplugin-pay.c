@@ -633,6 +633,7 @@ static void channel_hints_update(struct payment *root,
 	hint.scid.scid = *scid;
 	hint.scid.dir = direction;
 	hint.estimated_capacity = estimated_capacity;
+	hint.local = false;
 	tal_arr_expand(&root->channel_hints, hint);
 
 	plugin_log(
