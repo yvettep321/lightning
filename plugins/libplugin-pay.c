@@ -186,7 +186,7 @@ static void channel_hints_update(struct payment *p,
 				 u16 *htlc_budget)
 {
 	struct payment *root = payment_root(p);
-	struct channel_hint hint;
+	struct channel_hint hint, prev;
 
 	/* If the channel is marked as enabled it must have an estimate. */
 	assert(!enabled || estimated_capacity != NULL);
@@ -196,6 +196,8 @@ static void channel_hints_update(struct payment *p,
 		struct channel_hint *hint = &root->channel_hints[i];
 		if (short_channel_id_eq(&hint->scid.scid, &scid) &&
 		    hint->scid.dir == direction) {
+			prev = *hint;
+
 			/* Prefer to disable a channel. */
 			hint->enabled = hint->enabled & enabled;
 
@@ -206,6 +208,21 @@ static void channel_hints_update(struct payment *p,
 				hint->estimated_capacity = *estimated_capacity;
 			if (htlc_budget != NULL && *htlc_budget < hint->htlc_budget)
 				hint->htlc_budget = *htlc_budget;
+
+			plugin_log(root->plugin, LOG_DBG,
+				   "Updated existing channel_hint for %s from "
+				   "{enabled=%d, local=%d, cap=%s} to {enabled=%d, local=%d, cap=%s}",
+				   type_to_string(tmpctx,
+						  struct short_channel_id_dir,
+						  &hint->scid),
+				   prev.enabled,
+				   prev.local,
+				   prev.enabled?type_to_string(tmpctx, struct amount_msat, &prev.estimated_capacity):"UNKNOWN",
+				   hint->enabled,
+				   hint->local,
+				   hint->enabled?type_to_string(tmpctx, struct amount_msat, &hint->estimated_capacity):"UNKNOWN"
+				);
+
 			return;
 		}
 	}
