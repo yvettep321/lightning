@@ -42,9 +42,11 @@ commit("scripted: Remove submodules for materialization")
 mv(".gitignore", ".gitignore.bak")
 
 for module in submodules.values():
+    print(f"Cloning {module['url']} inot {module['path']}")
     gclone(module["url"], module["path"])
     d = os.getcwd()
     os.chdir(module["path"])
+    git("clean", "-xfd")
     git("checkout", module["hash"])
     os.chdir(d)
     rm(f"{module['path']}/.git")
