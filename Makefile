@@ -1,6 +1,6 @@
 #! /usr/bin/make
-VERSION_NAME="Federal Qualitative Strengthening"
-VERSION=0.9.3
+VERSION_NAME="Neutralizing Fee Therapy"
+VERSION=0.10.0
 
 ifeq ($(VERSION),)
 $(error "ERROR: git is required for generating version information")
