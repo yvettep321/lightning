@@ -105,6 +105,7 @@ CCAN_OBJS :=					\
 	ccan-crypto-siphash24.o			\
 	ccan-err.o				\
 	ccan-fdpass.o				\
+	ccan-graphql.o				\
 	ccan-htable.o				\
 	ccan-ilog.o				\
 	ccan-io-io.o				\
@@ -809,6 +810,8 @@ ccan-cdump.o: $(CCANDIR)/ccan/cdump/cdump.c
 ccan-strmap.o: $(CCANDIR)/ccan/strmap/strmap.c
 	@$(call VERBOSE, "cc $<", $(CC) $(CFLAGS) -c -o $@ $<)
 ccan-crypto-siphash24.o: $(CCANDIR)/ccan/crypto/siphash24/siphash24.c
+	@$(call VERBOSE, "cc $<", $(CC) $(CFLAGS) -c -o $@ $<)
+ccan-graphql.o: $(CCANDIR)/ccan/graphql/graphql.c
 	@$(call VERBOSE, "cc $<", $(CC) $(CFLAGS) -c -o $@ $<)
 ccan-htable.o: $(CCANDIR)/ccan/htable/htable.c
 	@$(call VERBOSE, "cc $<", $(CC) $(CFLAGS) -c -o $@ $<)
