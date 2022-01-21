@@ -29,7 +29,7 @@ def test_rpc_client(node_factory):
 
 def test_plugin_start(node_factory):
     bin_path = Path.cwd() / "target" / "debug" / "examples" / "cln-plugin-startup"
-    l1 = node_factory.get_node(options={"plugin": str(bin_path)})
+    l1 = node_factory.get_node(options={"plugin": str(bin_path), 'test-option': 31337})
 
     cfg = l1.rpc.listconfigs()
     p = cfg['plugins'][0]
@@ -37,7 +37,7 @@ def test_plugin_start(node_factory):
     expected = {
         'name': 'cln-plugin-startup',
         'options': {
-            'test-option': 42
+            'test-option': 31337
         },
         'path': None
     }
