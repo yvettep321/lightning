@@ -27,6 +27,23 @@ def test_rpc_client(node_factory):
     assert(b'0266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c03518' in out)
 
 
+def test_plugin_start(node_factory):
+    bin_path = Path.cwd() / "target" / "debug" / "examples" / "cln-plugin-startup"
+    l1 = node_factory.get_node(options={"plugin": str(bin_path)})
+
+    cfg = l1.rpc.listconfigs()
+    p = cfg['plugins'][0]
+    p['path'] = None  # The path is host-specific, so blank it.
+    expected = {
+        'name': 'cln-plugin-startup',
+        'options': {
+            'test-option': 42
+        },
+        'path': None
+    }
+    assert expected == p
+
+
 def test_grpc_connect(node_factory):
     """Attempts to connect to the grpc interface and call getinfo"""
     bin_path = Path.cwd() / "target" / "debug" / "grpc-plugin"
