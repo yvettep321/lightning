@@ -68,7 +68,7 @@ jobs:
           path: report.*
           if-no-files-found: ignore
 
-  check-dock:
+  check-doc:
     name: Check c-lightning doc
     runs-on: ubuntu-20.04
     env:
@@ -152,6 +152,7 @@ jobs:
       VALGRIND: 0
       EXPERIMENTAL_FEATURES: 0
       COMPAT: 1
+      PYTEST_OPTS: --reruns 5 --reruns-delay 1
     strategy:
       fail-fast: false
       matrix:
