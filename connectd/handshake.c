@@ -1,25 +1,21 @@
+#include "config.h"
 #include <assert.h>
-#include <bitcoin/privkey.h>
 #include <bitcoin/pubkey.h>
-#include <ccan/build_assert/build_assert.h>
 #include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
 #include <ccan/endian/endian.h>
 #include <ccan/io/io.h>
 #include <ccan/mem/mem.h>
 #include <common/crypto_state.h>
+#include <common/ecdh.h>
 #include <common/status.h>
 #include <common/type_to_string.h>
 #include <common/utils.h>
 #include <common/wireaddr.h>
 #include <connectd/handshake.h>
 #include <errno.h>
-#include <secp256k1.h>
 #include <secp256k1_ecdh.h>
 #include <sodium/crypto_aead_chacha20poly1305.h>
 #include <sodium/randombytes.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <wire/wire.h>
 
 #ifndef SUPERVERBOSE
 #define SUPERVERBOSE(...)
@@ -39,7 +35,7 @@ enum bolt8_side {
  */
 struct act_one {
 	u8 v;
-	u8 pubkey[PUBKEY_DER_LEN];
+	u8 pubkey[PUBKEY_CMPR_LEN];
 	u8 tag[crypto_aead_chacha20poly1305_ietf_ABYTES];
 };
 
@@ -68,7 +64,7 @@ static inline void check_act_one(const struct act_one *act1)
  */
 struct act_two {
 	u8 v;
-	u8 pubkey[PUBKEY_DER_LEN];
+	u8 pubkey[PUBKEY_CMPR_LEN];
 	u8 tag[crypto_aead_chacha20poly1305_ietf_ABYTES];
 };
 
@@ -98,7 +94,7 @@ static inline void check_act_two(const struct act_two *act2)
  */
 struct act_three {
 	u8 v;
-	u8 ciphertext[PUBKEY_DER_LEN + crypto_aead_chacha20poly1305_ietf_ABYTES];
+	u8 ciphertext[PUBKEY_CMPR_LEN + crypto_aead_chacha20poly1305_ietf_ABYTES];
 	u8 tag[crypto_aead_chacha20poly1305_ietf_ABYTES];
 };
 
@@ -177,11 +173,15 @@ struct handshake {
 	/* Are we initiator or responder. */
 	enum bolt8_side side;
 
+	/* Timeout timer if we take too long. */
+	struct oneshot *timeout;
+
 	/* Function to call once handshake complete. */
 	struct io_plan *(*cb)(struct io_conn *conn,
 			      const struct pubkey *their_id,
 			      const struct wireaddr_internal *wireaddr,
-			      const struct crypto_state *cs,
+			      struct crypto_state *cs,
+			      struct oneshot *timeout,
 			      void *cbarg);
 	void *cbarg;
 };
@@ -211,7 +211,7 @@ static void sha_mix_in(struct sha256 *h, const void *data, size_t len)
 /* h = SHA-256(h || pub.serializeCompressed()) */
 static void sha_mix_in_key(struct sha256 *h, const struct pubkey *key)
 {
-	u8 der[PUBKEY_DER_LEN];
+	u8 der[PUBKEY_CMPR_LEN];
 	size_t len = sizeof(der);
 
 	secp256k1_ec_pubkey_serialize(secp256k1_ctx, der, &len, &key->pubkey,
@@ -335,7 +335,7 @@ static struct io_plan *handshake_failed_(struct io_conn *conn,
 					 struct handshake *h,
 					 const char *function, int line)
 {
-	status_trace("%s: handshake failed %s:%u",
+	status_debug("%s: handshake failed %s:%u",
 		     h->side == RESPONDER ? "Responder" : "Initiator",
 		     function, line);
 	errno = EPROTO;
@@ -351,11 +351,13 @@ static struct io_plan *handshake_succeeded(struct io_conn *conn,
 	struct io_plan *(*cb)(struct io_conn *conn,
 			      const struct pubkey *their_id,
 			      const struct wireaddr_internal *addr,
-			      const struct crypto_state *cs,
+			      struct crypto_state *cs,
+			      struct oneshot *timeout,
 			      void *cbarg);
 	void *cbarg;
 	struct pubkey their_id;
 	struct wireaddr_internal addr;
+	struct oneshot *timeout;
 
 	/* BOLT #8:
 	 *
@@ -381,9 +383,10 @@ static struct io_plan *handshake_succeeded(struct io_conn *conn,
 	cbarg = h->cbarg;
 	their_id = h->their_id;
 	addr = h->addr;
+	timeout = h->timeout;
 
 	tal_free(h);
-	return cb(conn, &their_id, &addr, &cs, cbarg);
+	return cb(conn, &their_id, &addr, &cs, timeout, cbarg);
 }
 
 static struct handshake *new_handshake(const tal_t *ctx,
@@ -425,11 +428,11 @@ static struct handshake *new_handshake(const tal_t *ctx,
 	 * into the handshake digest:
 	 *
 	 * * The initiating node mixes in the responding node's static public
-	 *    key serialized in Bitcoin's DER-compressed format:
+	 *    key serialized in Bitcoin's compressed format:
 	 *    * `h = SHA-256(h || rs.pub.serializeCompressed())`
 	 *
 	 * * The responding node mixes in their local static public key
-	 *   serialized in Bitcoin's DER-compressed format:
+	 *   serialized in Bitcoin's compressed format:
 	 *    * `h = SHA-256(h || ls.pub.serializeCompressed())`
 	 */
 	sha_mix_in_key(&handshake->h, responder_id);
@@ -442,7 +445,7 @@ static struct handshake *new_handshake(const tal_t *ctx,
 static struct io_plan *act_three_initiator(struct io_conn *conn,
 					   struct handshake *h)
 {
-	u8 spub[PUBKEY_DER_LEN];
+	u8 spub[PUBKEY_CMPR_LEN];
 	size_t len = sizeof(spub);
 
 	SUPERVERBOSE("Initiator: Act 3");
@@ -471,10 +474,8 @@ static struct io_plan *act_three_initiator(struct io_conn *conn,
 	 * 3. `se = ECDH(s.priv, re)`
 	 *     * where `re` is the ephemeral public key of the responder
 	 */
-	h->ss = hsm_do_ecdh(h, &h->re);
-	if (!h->ss)
-		return handshake_failed(conn, h);
-
+	h->ss = tal(h, struct secret);
+	ecdh(&h->re, h->ss);
 	SUPERVERBOSE("# ss=0x%s", tal_hexstr(tmpctx, h->ss, sizeof(*h->ss)));
 
 	/* BOLT #8:
@@ -547,7 +548,7 @@ static struct io_plan *act_two_initiator2(struct io_conn *conn,
 	 * 5. `es = ECDH(s.priv, re)`
 	 */
 	if (!secp256k1_ecdh(secp256k1_ctx, h->ss->data, &h->re.pubkey,
-			    h->e.priv.secret.data))
+			    h->e.priv.secret.data, NULL, NULL))
 		return handshake_failed(conn, h);
 
 	SUPERVERBOSE("# ss=0x%s", tal_hexstr(tmpctx, h->ss, sizeof(*h->ss)));
@@ -638,7 +639,8 @@ static struct io_plan *act_one_initiator(struct io_conn *conn,
 	 */
 	h->ss = tal(h, struct secret);
 	if (!secp256k1_ecdh(secp256k1_ctx, h->ss->data,
-			    &h->their_id.pubkey, h->e.priv.secret.data))
+			    &h->their_id.pubkey, h->e.priv.secret.data,
+			    NULL, NULL))
 		return handshake_failed(conn, h);
 
 	SUPERVERBOSE("# ss=0x%s", tal_hexstr(tmpctx, h->ss->data, sizeof(h->ss->data)));
@@ -689,7 +691,7 @@ static struct io_plan *act_one_initiator(struct io_conn *conn,
 static struct io_plan *act_three_responder2(struct io_conn *conn,
 					    struct handshake *h)
 {
-	u8 der[PUBKEY_DER_LEN];
+	u8 der[PUBKEY_CMPR_LEN];
 
 	SUPERVERBOSE("input: 0x%s", tal_hexstr(tmpctx, &h->act3, ACT_THREE_SIZE));
 
@@ -739,7 +741,7 @@ static struct io_plan *act_three_responder2(struct io_conn *conn,
 	 *      * where `e` is the responder's original ephemeral key
 	 */
 	if (!secp256k1_ecdh(secp256k1_ctx, h->ss->data, &h->their_id.pubkey,
-			    h->e.priv.secret.data))
+			    h->e.priv.secret.data, NULL, NULL))
 		return handshake_failed(conn, h);
 
 	SUPERVERBOSE("# ss=0x%s", tal_hexstr(tmpctx, h->ss, sizeof(*h->ss)));
@@ -814,7 +816,7 @@ static struct io_plan *act_two_responder(struct io_conn *conn,
 	 *        during Act One
 	 */
 	if (!secp256k1_ecdh(secp256k1_ctx, h->ss->data, &h->re.pubkey,
-			    h->e.priv.secret.data))
+			    h->e.priv.secret.data, NULL, NULL))
 		return handshake_failed(conn, h);
 	SUPERVERBOSE("# ss=0x%s", tal_hexstr(tmpctx, h->ss, sizeof(*h->ss)));
 
@@ -862,7 +864,6 @@ static struct io_plan *act_two_responder(struct io_conn *conn,
 	return io_write(conn, &h->act2, ACT_TWO_SIZE, act_three_responder, h);
 }
 
-
 static struct io_plan *act_one_responder2(struct io_conn *conn,
 					 struct handshake *h)
 {
@@ -902,10 +903,8 @@ static struct io_plan *act_one_responder2(struct io_conn *conn,
 	 *    * The responder performs an ECDH between its static private key and
 	 *      the initiator's ephemeral public key.
 	 */
-	h->ss = hsm_do_ecdh(h, &h->re);
-	if (!h->ss)
-		return handshake_failed(conn, h);
-
+	h->ss = tal(h, struct secret);
+	ecdh(&h->re, h->ss);
 	SUPERVERBOSE("# ss=0x%s", tal_hexstr(tmpctx, h->ss, sizeof(*h->ss)));
 
 	/* BOLT #8:
@@ -964,10 +963,12 @@ static struct io_plan *act_one_responder(struct io_conn *conn,
 struct io_plan *responder_handshake_(struct io_conn *conn,
 				     const struct pubkey *my_id,
 				     const struct wireaddr_internal *addr,
+				     struct oneshot *timeout,
 				     struct io_plan *(*cb)(struct io_conn *,
 							   const struct pubkey *,
 							   const struct wireaddr_internal *,
-							   const struct crypto_state *,
+							   struct crypto_state *,
+							   struct oneshot *,
 							   void *cbarg),
 				     void *cbarg)
 {
@@ -978,6 +979,7 @@ struct io_plan *responder_handshake_(struct io_conn *conn,
 	h->addr = *addr;
 	h->cbarg = cbarg;
 	h->cb = cb;
+	h->timeout = timeout;
 
 	return act_one_responder(conn, h);
 }
@@ -986,10 +988,12 @@ struct io_plan *initiator_handshake_(struct io_conn *conn,
 				     const struct pubkey *my_id,
 				     const struct pubkey *their_id,
 				     const struct wireaddr_internal *addr,
+				     struct oneshot *timeout,
 				     struct io_plan *(*cb)(struct io_conn *,
 							   const struct pubkey *,
 							   const struct wireaddr_internal *,
-							   const struct crypto_state *,
+							   struct crypto_state *,
+							   struct oneshot *timeout,
 							   void *cbarg),
 				     void *cbarg)
 {
@@ -1001,6 +1005,7 @@ struct io_plan *initiator_handshake_(struct io_conn *conn,
 	h->addr = *addr;
 	h->cbarg = cbarg;
 	h->cb = cb;
+	h->timeout = timeout;
 
 	return act_one_initiator(conn, h);
 }

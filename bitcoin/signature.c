@@ -1,14 +1,15 @@
-#include "privkey.h"
-#include "pubkey.h"
-#include "script.h"
-#include "shadouble.h"
-#include "signature.h"
-#include "tx.h"
+#include "config.h"
 #include <assert.h>
-#include <ccan/cast/cast.h>
+#include <bitcoin/privkey.h>
+#include <bitcoin/psbt.h>
+#include <bitcoin/pubkey.h>
+#include <bitcoin/script.h>
+#include <bitcoin/shadouble.h>
+#include <bitcoin/signature.h>
+#include <bitcoin/tx.h>
 #include <ccan/mem/mem.h>
 #include <common/type_to_string.h>
-#include <common/utils.h>
+#include <wire/wire.h>
 
 #undef DEBUG
 #ifdef DEBUG
@@ -34,19 +35,19 @@ static void dump_tx(const char *msg,
 {
 	size_t i, j;
 	warnx("%s tx version %u locktime %#x:",
-	      msg, tx->version, tx->lock_time);
-	for (i = 0; i < tal_count(tx->input); i++) {
+	      msg, tx->wtx->version, tx->wtx->locktime);
+	for (i = 0; i < tx->wtx->num_inputs; i++) {
 		warnx("input[%zu].txid = "SHA_FMT, i,
-		      SHA_VALS(tx->input[i].txid.sha.u.u8));
-		warnx("input[%zu].index = %u", i, tx->input[i].index);
+		      SHA_VALS(tx->wtx->inputs[i].txhash));
+		warnx("input[%zu].index = %u", i, tx->wtx->inputs[i].index);
 	}
-	for (i = 0; i < tal_count(tx->output); i++) {
+	for (i = 0; i < tx->wtx->num_outputs; i++) {
 		warnx("output[%zu].amount = %llu",
-		      i, (long long)tx->output[i].amount);
+		      i, (long long)tx->wtx->outputs[i].satoshi);
 		warnx("output[%zu].script = %zu",
-		      i, tal_count(tx->output[i].script));
-		for (j = 0; j < tal_count(tx->output[i].script); j++)
-			fprintf(stderr, "%02x", tx->output[i].script[j]);
+		      i, tx->wtx->outputs[i].script_len);
+		for (j = 0; j < tx->wtx->outputs[i].script_len; j++)
+			fprintf(stderr, "%02x", tx->wtx->outputs[i].script[j]);
 		fprintf(stderr, "\n");
 	}
 	warnx("input[%zu].script = %zu", inputnum, tal_count(script));
@@ -75,30 +76,85 @@ static void dump_tx(const char *msg UNUSED,
 }
 #endif
 
+/* Taken from https://github.com/bitcoin/bitcoin/blob/master/src/key.cpp */
+/* Check that the sig has a low R value and will be less than 71 bytes */
+static bool sig_has_low_r(const secp256k1_ecdsa_signature* sig)
+{
+	unsigned char compact_sig[64];
+	secp256k1_ecdsa_signature_serialize_compact(secp256k1_ctx, compact_sig, sig);
+
+	/* In DER serialization, all values are interpreted as big-endian, signed
+	 * integers. The highest bit in the integer indicates its signed-ness; 0 is
+	 * positive, 1 is negative. When the value is interpreted as a negative
+	 * integer, it must be converted to a positive value by prepending a 0x00
+	 * byte so that the highest bit is 0. We can avoid this prepending by
+	 * ensuring that our highest bit is always 0, and thus we must check that
+	 * the first byte is less than 0x80. */
+	return compact_sig[0] < 0x80;
+}
+
+#if DEVELOPER
+/* Some of the spec test vectors assume no sig grinding. */
+extern bool dev_no_grind;
+
+bool dev_no_grind = false;
+#endif
+
 void sign_hash(const struct privkey *privkey,
 	       const struct sha256_double *h,
 	       secp256k1_ecdsa_signature *s)
 {
 	bool ok;
+	unsigned char extra_entropy[32] = {0};
 
-	ok = secp256k1_ecdsa_sign(secp256k1_ctx,
-				  s,
-				  h->sha.u.u8,
-				  privkey->secret.data, NULL, NULL);
+	/* Grind for low R */
+	do {
+		ok = secp256k1_ecdsa_sign(secp256k1_ctx,
+					  s,
+					  h->sha.u.u8,
+					  privkey->secret.data, NULL,
+					  IFDEV(dev_no_grind ? NULL
+						: extra_entropy,
+						extra_entropy));
+		((u32 *)extra_entropy)[0]++;
+		if (IFDEV(dev_no_grind, false))
+			break;
+	} while (!sig_has_low_r(s));
+
 	assert(ok);
 }
 
-static void sha256_tx_one_input(const struct bitcoin_tx *tx,
-				size_t input_num,
-				const u8 *script,
-				const u8 *witness_script,
-				enum sighash_type sighash_type,
-				struct sha256_double *hash)
+void bitcoin_tx_hash_for_sig(const struct bitcoin_tx *tx, unsigned int in,
+			     const u8 *script,
+			     enum sighash_type sighash_type,
+			     struct sha256_double *dest)
 {
-	assert(input_num < tal_count(tx->input));
+	int ret;
+	u8 value[9];
+	u64 input_val_sats;
+	struct amount_sat input_amt;
+	int flags = WALLY_TX_FLAG_USE_WITNESS;
 
-	sha256_tx_for_sig(hash, tx, input_num, script, witness_script,
-			  sighash_type);
+	input_amt = psbt_input_get_amount(tx->psbt, in);
+	input_val_sats = input_amt.satoshis; /* Raw: type conversion */
+
+	/* Wally can allocate here, iff tx doesn't fit on stack */
+	tal_wally_start();
+	if (is_elements(chainparams)) {
+		ret = wally_tx_confidential_value_from_satoshi(input_val_sats, value, sizeof(value));
+		assert(ret == WALLY_OK);
+		ret = wally_tx_get_elements_signature_hash(
+		    tx->wtx, in, script, tal_bytelen(script), value,
+		    sizeof(value), sighash_type, flags, dest->sha.u.u8,
+		    sizeof(*dest));
+		assert(ret == WALLY_OK);
+	} else {
+		ret = wally_tx_get_btc_signature_hash(
+		    tx->wtx, in, script, tal_bytelen(script), input_val_sats,
+		    sighash_type, flags, dest->sha.u.u8, sizeof(*dest));
+		assert(ret == WALLY_OK);
+	}
+	tal_wally_end(tx->wtx);
 }
 
 void sign_tx_input(const struct bitcoin_tx *tx,
@@ -110,11 +166,14 @@ void sign_tx_input(const struct bitcoin_tx *tx,
 		   struct bitcoin_signature *sig)
 {
 	struct sha256_double hash;
+	bool use_segwit = witness_script != NULL;
+	const u8 *script = use_segwit ? witness_script : subscript;
 
 	assert(sighash_type_valid(sighash_type));
+
 	sig->sighash_type = sighash_type;
-	sha256_tx_one_input(tx, in, subscript, witness_script,
-			    sighash_type, &hash);
+	bitcoin_tx_hash_for_sig(tx, in, script, sighash_type, &hash);
+
 	dump_tx("Signing", tx, in, subscript, key, &hash);
 	sign_hash(privkey, &hash, &sig->s);
 }
@@ -125,6 +184,14 @@ bool check_signed_hash(const struct sha256_double *hash,
 {
 	int ret;
 
+	/* BOLT #2:
+	 *
+	 * - if `signature` is incorrect OR non-compliant with
+	 *   LOW-S-standard rule
+	 */
+	/* From the secp256k1_ecdsa_verify documentation: "To avoid
+	 * accepting malleable signatures, only ECDSA signatures in
+	 * lower-S form are accepted." */
 	ret = secp256k1_ecdsa_verify(secp256k1_ctx,
 				     signature,
 				     hash->sha.u.u8, &key->pubkey);
@@ -138,6 +205,8 @@ bool check_tx_sig(const struct bitcoin_tx *tx, size_t input_num,
 		  const struct bitcoin_signature *sig)
 {
 	struct sha256_double hash;
+	bool use_segwit = witness_script != NULL;
+	const u8 *script = use_segwit ? witness_script : redeemscript;
 	bool ret;
 
 	/* We only support a limited subset of sighash types. */
@@ -147,10 +216,10 @@ bool check_tx_sig(const struct bitcoin_tx *tx, size_t input_num,
 		if (sig->sighash_type != (SIGHASH_SINGLE|SIGHASH_ANYONECANPAY))
 			return false;
 	}
-	assert(input_num < tal_count(tx->input));
+	assert(input_num < tx->wtx->num_inputs);
 
-	sha256_tx_one_input(tx, input_num, redeemscript, witness_script,
-			    sig->sighash_type, &hash);
+	bitcoin_tx_hash_for_sig(tx, input_num, script, sig->sighash_type, &hash);
+	dump_tx("check_tx_sig", tx, input_num, script, key, &hash);
 
 	ret = check_signed_hash(&hash, &sig->s, key);
 	if (!ret)
@@ -260,8 +329,7 @@ bool signature_from_der(const u8 *der, size_t len, struct bitcoin_signature *sig
 	return true;
 }
 
-static char *signature_to_hexstr(const tal_t *ctx,
-				 const secp256k1_ecdsa_signature *sig)
+char *fmt_signature(const tal_t *ctx, const secp256k1_ecdsa_signature *sig)
 {
 	u8 der[72];
 	size_t len = 72;
@@ -271,7 +339,7 @@ static char *signature_to_hexstr(const tal_t *ctx,
 
 	return tal_hexstr(ctx, der, len);
 }
-REGISTER_TYPE_TO_STRING(secp256k1_ecdsa_signature, signature_to_hexstr);
+REGISTER_TYPE_TO_STRING(secp256k1_ecdsa_signature, fmt_signature);
 
 static char *bitcoin_signature_to_hexstr(const tal_t *ctx,
 					 const struct bitcoin_signature *sig)
@@ -282,3 +350,68 @@ static char *bitcoin_signature_to_hexstr(const tal_t *ctx,
 	return tal_hexstr(ctx, der, len);
 }
 REGISTER_TYPE_TO_STRING(bitcoin_signature, bitcoin_signature_to_hexstr);
+
+void fromwire_bitcoin_signature(const u8 **cursor, size_t *max,
+				struct bitcoin_signature *sig)
+{
+	fromwire_secp256k1_ecdsa_signature(cursor, max, &sig->s);
+	sig->sighash_type = fromwire_u8(cursor, max);
+	if (!sighash_type_valid(sig->sighash_type))
+		fromwire_fail(cursor, max);
+}
+
+void towire_bitcoin_signature(u8 **pptr, const struct bitcoin_signature *sig)
+{
+	assert(sighash_type_valid(sig->sighash_type));
+	towire_secp256k1_ecdsa_signature(pptr, &sig->s);
+	towire_u8(pptr, sig->sighash_type);
+}
+
+void towire_bip340sig(u8 **pptr, const struct bip340sig *bip340sig)
+{
+	towire_u8_array(pptr, bip340sig->u8, sizeof(bip340sig->u8));
+}
+
+void fromwire_bip340sig(const u8 **cursor, size_t *max,
+			struct bip340sig *bip340sig)
+{
+	fromwire_u8_array(cursor, max, bip340sig->u8, sizeof(bip340sig->u8));
+}
+
+char *fmt_bip340sig(const tal_t *ctx, const struct bip340sig *bip340sig)
+{
+	return tal_hexstr(ctx, bip340sig->u8, sizeof(bip340sig->u8));
+}
+
+REGISTER_TYPE_TO_HEXSTR(bip340sig);
+
+/* BIP-340:
+ *
+ * This proposal suggests to include the tag by prefixing the hashed
+ * data with ''SHA256(tag) || SHA256(tag)''. Because this is a 64-byte
+ * long context-specific constant and the ''SHA256'' block size is
+ * also 64 bytes, optimized implementations are possible (identical to
+ * SHA256 itself, but with a modified initial state). Using SHA256 of
+ * the tag name itself is reasonably simple and efficient for
+ * implementations that don't choose to use the optimization.
+ */
+
+/* For caller convenience, we hand in tag in parts (any can be "") */
+void bip340_sighash_init(struct sha256_ctx *sctx,
+			 const char *tag1,
+			 const char *tag2,
+			 const char *tag3)
+{
+	struct sha256 taghash;
+
+	sha256_init(sctx);
+	sha256_update(sctx, memcheck(tag1, strlen(tag1)), strlen(tag1));
+	sha256_update(sctx, memcheck(tag2, strlen(tag2)), strlen(tag2));
+	sha256_update(sctx, memcheck(tag3, strlen(tag3)), strlen(tag3));
+	sha256_done(sctx, &taghash);
+
+	sha256_init(sctx);
+	sha256_update(sctx, &taghash, sizeof(taghash));
+	sha256_update(sctx, &taghash, sizeof(taghash));
+}
+

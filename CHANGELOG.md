@@ -1,97 +1,35 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
+and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-
 ### Added
 
-- plugins: fully enabled, and ready for you to write some!
-- plugins: `pay` is now a plugin.
-- protocol: `pay` will now use routehints in invoices if it needs to.
-- lightning-cli: `help <cmd>` finds man pages even if `make install` not run.
-- JSON API: `waitsendpay` now has an `erring_direction` field.
-- JSON API: `listpeers` now has a `direction` field in `channels`.
-- JSON API: `listchannels` now takes a `source` option to filter by node id.
-- JSON API: New command `paystatus` gives detailed information on `pay` commands.
-- JSON API: `getroute` `riskfactor` argument is simplified; `pay` now defaults to setting it to 10.
-
-### Changed
-
-- The `short_channel_id` separator has been changed to be `x` to match the specification.
-- JSON API: `listpeers` now includes `funding_allocation_msat`, which returns a map of the amounts initially funded to the channel by each peer, indexed by channel id.
-- `option_data_loss_protect` is now enabled by default.
-- JSON API: `help` with a `command` argument gives a JSON array, like other commands.
-- build: we'll use the system libbase58 and libsodium if found suitable.
-
-### Deprecated
-
-Note: You should always set `allow-deprecated-apis=false` to test for
-changes.
-
-- JSON API: `short_channel_id` fields in JSON commands with `:` separators (use `x` instead).
-
-### Removed
-
-- JSON API: the `waitsendpay` command error return no longer includes `channel_update`
-
-### Fixed
-
-- Protocol: handling `query_channel_range` for large numbers of blocks
-  (eg. 4 billion) was slow due to a bug.
-- Fixed occasional deadlock with peers when exchanging huge amounts of gossip.
-- You can no longer make giant unpayable "wumbo" invoices.
-- CLTV of total route now correctly evaluated when finding best route.
-- `riskfactor` arguments to `pay` and `getroute` now have an effect.
-
-### Security
-
-## [0.6.3] - 2019-01-09: "The Smallblock Conspiracy"
-
-This release named by @molxyz and [@ctrlbreak](https://twitter.com/ctrlbreak).
-
-### Added
-
-- JSON API: New command `check` checks the validity of a JSON API call without running it.
 - JSON API: `getinfo` now returns `num_peers` `num_pending_channels`,
   `num_active_channels` and `num_inactive_channels` fields.
 - JSON API: use `\n\n` to terminate responses, for simplified parsing (pylightning now relies on this)
-- JSON API: `fundchannel` now includes an `announce` option, when false it will keep channel private. Defaults to true.
-- JSON API: `listpeers`'s `channels` now includes a `private` flag to indicate if channel is announced or not.
-- JSON API: `invoice` route hints may now include private channels if you have no public ones, unless new option `exposeprivatechannels` is false.
-- Plugins: experimental plugin support for `lightningd`, including option passthrough and JSON-RPC passthrough.
+- Plugins: Added plugins to `lightningd` and implemented the option passthrough.
 
 ### Changed
 
 - JSON API: `pay` and `decodepay` accept and ignore `lightning:` prefixes.
-- pylightning: Allow either keyword arguments or positional arguments.
-- JSON-RPC: messages are now separated by 2 consecutive newlines.
-- JSON-RPC: `jsonrpc`:`2.0` now included in json-rpc command calls. complies with spec.
 
 ### Deprecated
 
 Note: You should always set `allow-deprecated-apis=false` to test for
 changes.
 
-- pylightning: Support for pre-2-newline JSON-RPC (<= 0.6.2 lightningd) is deprecated.
-
 ### Removed
-
-- option_data_loss_protect is now only offered if EXPERIMENTAL_FEATURES is enabled, since it seems incompatible with lnd and has known bugs.
 
 ### Fixed
 
 - JSON API: uppercase invoices now parsed correctly (broken in 0.6.2).
 - JSON API: commands are once again read even if one hasn't responded yet (broken in 0.6.2).
 - Protocol: allow lnd to send `update_fee` before `funding_locked`.
-- Protocol: fix limit on how much funder can send (fee was 1000x too small)
-- Protocol: don't send invalid onion errors if peer says onion was bad.
-- Protocol: don't crash when peer sends a 0-block-expiry HTLC.
 - pylightning: handle multiple simultanous RPC replies reliably.
-
 
 ### Security
 
@@ -130,8 +68,6 @@ changes.
 - JSON RPC: `global_features` and `local_features` fields: use `globalfeatures` and `localfeatures` as per BOLT #1.
 
 ### Removed
-
-- JSON API: the optional 'seed' parameter to `getroute` was removed.
 
 ### Fixed
 
@@ -279,8 +215,7 @@ There predate the BOLT specifications, and are only of vague historic interest:
 6. [0.5.1] - 2016-10-21
 7. [0.5.2] - 2016-11-21: "Bitcoin Savings & Trust Daily Interest II"
 
-[Unreleased]: https://github.com/ElementsProject/lightning/compare/v0.6.3...HEAD
-[0.6.3]: https://github.com/ElementsProject/lightning/releases/tag/v0.6.3
+[Unreleased]: https://github.com/ElementsProject/lightning/compare/v0.6.2...HEAD
 [0.6.2]: https://github.com/ElementsProject/lightning/releases/tag/v0.6.2
 [0.6.1]: https://github.com/ElementsProject/lightning/releases/tag/v0.6.1
 [0.6]: https://github.com/ElementsProject/lightning/releases/tag/v0.6

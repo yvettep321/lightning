@@ -2,8 +2,6 @@
 #define LIGHTNING_COMMON_PARAM_H
 #include "config.h"
 #include <common/json.h>
-#include <common/json_tok.h>
-#include <stdbool.h>
 
 /*~ Greetings adventurer!
  *
@@ -58,13 +56,25 @@ typedef struct command_result *(*param_cbx)(struct command *cmd,
 					    const jsmntok_t *tok,
 					    void **arg);
 
+/**
+ * Parse the first json value.
+ *
+ * name...: NULL-terminated array of valid values.
+ *
+ * Returns subcommand: if it returns NULL if you should return
+ * command_param_failed() immediately.
+ */
+const char *param_subcommand(struct command *cmd, const char *buffer,
+			     const jsmntok_t tokens[],
+			     const char *name, ...) LAST_ARG_NULL;
+
 /*
  * Add a required parameter.
  */
-#define p_req(name, cbx, arg)                                \
+#define p_req(name, cbx, arg)				     \
 	      name"",                                        \
 	      true,                                          \
-	      (cbx),                                         \
+	      (param_cbx)(cbx),				     \
 	      (arg) + 0*sizeof((cbx)((struct command *)NULL, \
 			       (const char *)NULL,           \
 			       (const char *)NULL,           \
@@ -77,7 +87,7 @@ typedef struct command_result *(*param_cbx)(struct command *cmd,
 #define p_opt(name, cbx, arg)                                   \
 	      name"",                                           \
 	      false,                                            \
-	      (cbx),                                            \
+	      (param_cbx)(cbx),                                 \
 	      ({ *arg = NULL;                                   \
 		 (arg) + 0*sizeof((cbx)((struct command *)NULL, \
 		                  (const char *)NULL,           \
@@ -91,7 +101,7 @@ typedef struct command_result *(*param_cbx)(struct command *cmd,
 #define p_opt_def(name, cbx, arg, def)				    \
 		  name"",					    \
 		  false,					    \
-		  (cbx),				 	    \
+		  (param_cbx)(cbx),				    \
 		  ({ (*arg) = tal((cmd), typeof(**arg));            \
 		     (**arg) = (def);                               \
 		     (arg) + 0*sizeof((cbx)((struct command *)NULL, \

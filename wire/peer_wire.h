@@ -2,7 +2,12 @@
 #define LIGHTNING_WIRE_PEER_WIRE_H
 #include "config.h"
 #include <stdbool.h>
-#include <wire/gen_peer_wire.h>
+
+#if EXPERIMENTAL_FEATURES
+#include <wire/peer_exp_wiregen.h>
+#else
+#include <wire/peer_wiregen.h>
+#endif
 
 /* BOLT #1:
  *
@@ -10,13 +15,16 @@
  *   - upon receiving a message of _odd_, unknown type:
  *     - MUST ignore the received message.
  *   - upon receiving a message of _even_, unknown type:
- *     - MUST fail the channels.
+ *     - MUST close the connection.
+ *     - MAY fail the channels.
  */
 
 /* Return true if it's an unknown ODD message.  cursor is a tal ptr. */
 bool is_unknown_msg_discardable(const u8 *cursor);
 /* Return true if it's a message for gossipd. */
 bool is_msg_for_gossipd(const u8 *cursor);
+/* Return true if it's a gossip update or announcement. */
+bool is_msg_gossip_broadcast(const u8 *cursor);
 
 /* Extract channel_id from various packets, return true if possible. */
 bool extract_channel_id(const u8 *in_pkt, struct channel_id *channel_id);

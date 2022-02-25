@@ -2,10 +2,11 @@
 #define LIGHTNING_BITCOIN_SIGNATURE_H
 #include "config.h"
 #include <ccan/short_types/short_types.h>
+#include <ccan/tal/tal.h>
 #include <secp256k1.h>
-#include <stdbool.h>
 
 struct sha256_double;
+struct sha256_ctx;
 struct bitcoin_tx;
 struct pubkey;
 struct privkey;
@@ -47,7 +48,21 @@ struct bitcoin_signature {
 };
 
 /**
- * sign_hash - produce a raw secp256k1 signature.
+ * bitcoin_tx_hash_for_sig - produce hash for a transaction
+ *
+ * @tx - tx to hash
+ * @in - index that this 'hash' is for
+ * @script - script for the index that's being 'hashed for'
+ * @sighash_type - sighash_type to hash for
+ * @dest - hash result
+ */
+void bitcoin_tx_hash_for_sig(const struct bitcoin_tx *tx, unsigned int in,
+			     const u8 *script,
+			     enum sighash_type sighash_type,
+			     struct sha256_double *dest);
+
+/**
+ * sign_hash - produce a raw secp256k1 signature (with low R value).
  * @p: secret key
  * @h: hash to sign.
  * @sig: signature to fill in and return.
@@ -111,5 +126,28 @@ size_t signature_to_der(u8 der[73], const struct bitcoin_signature *sig);
 
 /* Parse DER encoding into signature sig */
 bool signature_from_der(const u8 *der, size_t len, struct bitcoin_signature *sig);
+
+/* Wire marshalling and unmarshalling */
+void towire_bitcoin_signature(u8 **pptr, const struct bitcoin_signature *sig);
+void fromwire_bitcoin_signature(const u8 **cursor, size_t *max,
+				struct bitcoin_signature *sig);
+
+/* Schnorr */
+struct bip340sig {
+	u8 u8[64];
+};
+void towire_bip340sig(u8 **pptr, const struct bip340sig *bip340sig);
+void fromwire_bip340sig(const u8 **cursor, size_t *max,
+			struct bip340sig *bip340sig);
+
+/* Get a hex string sig */
+char *fmt_signature(const tal_t *ctx, const secp256k1_ecdsa_signature *sig);
+char *fmt_bip340sig(const tal_t *ctx, const struct bip340sig *bip340sig);
+
+/* For caller convenience, we hand in tag in parts (any can be "") */
+void bip340_sighash_init(struct sha256_ctx *sctx,
+			 const char *tag1,
+			 const char *tag2,
+			 const char *tag3);
 
 #endif /* LIGHTNING_BITCOIN_SIGNATURE_H */

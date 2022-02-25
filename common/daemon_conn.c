@@ -1,6 +1,6 @@
+#include "config.h"
 #include <ccan/fdpass/fdpass.h>
 #include <ccan/io/fdpass/fdpass.h>
-#include <ccan/take/take.h>
 #include <common/daemon_conn.h>
 #include <wire/wire_io.h>
 #include <wire/wire_sync.h>
@@ -54,7 +54,7 @@ static struct io_plan *daemon_conn_write_next(struct io_conn *conn,
 	}
 
 	if (msg) {
-		int fd = msg_extract_fd(msg);
+		int fd = msg_extract_fd(dc->out, msg);
 		if (fd >= 0) {
 			tal_free(msg);
 			return io_send_fd(conn, fd, true,
@@ -82,7 +82,7 @@ bool daemon_conn_sync_flush(struct daemon_conn *dc)
 
 	/* Flush existing messages. */
 	while ((msg = msg_dequeue(dc->out)) != NULL) {
-		int fd = msg_extract_fd(msg);
+		int fd = msg_extract_fd(dc->out, msg);
 		if (fd >= 0) {
 			tal_free(msg);
 			if (!fdpass_send(daemon_fd, fd))
@@ -125,7 +125,7 @@ struct daemon_conn *daemon_conn_new_(const tal_t *ctx, int fd,
 	dc->outq_empty = outq_empty;
 	dc->arg = arg;
 	dc->msg_in = NULL;
-	dc->out = msg_queue_new(dc);
+	dc->out = msg_queue_new(dc, true);
 
 	dc->conn = io_new_conn(dc, fd, daemon_conn_start, dc);
 	tal_add_destructor2(dc->conn, destroy_dc_from_conn, dc);
@@ -145,4 +145,9 @@ void daemon_conn_send_fd(struct daemon_conn *dc, int fd)
 void daemon_conn_wake(struct daemon_conn *dc)
 {
 	msg_wake(dc->out);
+}
+
+size_t daemon_conn_queue_length(const struct daemon_conn *dc)
+{
+	return msg_queue_length(dc->out);
 }

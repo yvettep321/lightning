@@ -1,20 +1,23 @@
-#include <bitcoin/chainparams.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/err/err.h>
+#include <ccan/json_escape/json_escape.h>
 #include <ccan/mem/mem.h>
 #include <ccan/opt/opt.h>
 #include <ccan/opt/private.h>
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/short_types/short_types.h>
-#include <ccan/tal/grab_file/grab_file.h>
+#include <ccan/str/hex/hex.h>
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
-#include <common/configdir.h>
+#include <common/base64.h>
+#include <common/channel_id.h>
+#include <common/derive_basepoints.h>
+#include <common/features.h>
 #include <common/json_command.h>
-#include <common/json_escaped.h>
 #include <common/jsonrpc_errors.h>
 #include <common/memleak.h>
 #include <common/param.h>
+#include <common/utils.h>
 #include <common/version.h>
 #include <common/wireaddr.h>
 #include <errno.h>
@@ -29,41 +32,21 @@
 #include <lightningd/options.h>
 #include <lightningd/plugin.h>
 #include <lightningd/subd.h>
+#include <sodium.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 #include <wire/wire.h>
 
-bool deprecated_apis = true;
-
-/* Tal wrappers for opt. */
-static void *opt_allocfn(size_t size)
-{
-	return tal_arr_label(NULL, char, size, TAL_LABEL("opt_allocfn", ""));
-}
-
-static void *tal_reallocfn(void *ptr, size_t size)
-{
-	if (!ptr) {
-		/* realloc(NULL) call is to allocate opt_table */
-		static bool opt_table_alloced = false;
-		if (!opt_table_alloced) {
-			opt_table_alloced = true;
-			return notleak(opt_allocfn(size));
-		}
-		return opt_allocfn(size);
-	}
-	tal_resize_(&ptr, 1, size, false);
-	return ptr;
-}
-
-static void tal_freefn(void *ptr)
-{
-	tal_free(ptr);
-}
+/* Declare opt_add_addr here, because we we call opt_add_addr
+ * and opt_announce_addr vice versa
+*/
+static char *opt_add_addr(const char *arg, struct lightningd *ld);
 
 /* FIXME: Put into ccan/time. */
 #define TIME_FROM_SEC(sec) { { .tv_nsec = 0, .tv_sec = sec } }
@@ -123,6 +106,30 @@ static char *opt_set_s32(const char *arg, s32 *u)
 	return NULL;
 }
 
+static char *opt_set_mode(const char *arg, mode_t *m)
+{
+	char *endp;
+	long l;
+
+	assert(arg != NULL);
+
+	/* Ensure length, and starts with 0.  */
+	if (strlen(arg) != 4 || arg[0] != '0')
+		return tal_fmt(NULL, "'%s' is not a file mode", arg);
+
+	/* strtol, manpage, yech.  */
+	errno = 0;
+	l = strtol(arg, &endp, 8); /* Octal.  */
+	if (errno || *endp)
+		return tal_fmt(NULL, "'%s' is not a file mode", arg);
+	*m = l;
+	/* Range check not needed, previous strlen checks ensures only
+	 * 9-bit, which fits mode_t (unless your Unix is seriously borked).
+	 */
+
+	return NULL;
+}
+
 static char *opt_add_addr_withtype(const char *arg,
 				   struct lightningd *ld,
 				   enum addr_listen_announce ala,
@@ -145,21 +152,21 @@ static char *opt_add_addr_withtype(const char *arg,
 
 }
 
-static char *opt_add_addr(const char *arg, struct lightningd *ld)
-{
-	return opt_add_addr_withtype(arg, ld, ADDR_LISTEN_AND_ANNOUNCE, true);
-}
-
-static char *opt_add_bind_addr(const char *arg, struct lightningd *ld)
-{
-	return opt_add_addr_withtype(arg, ld, ADDR_LISTEN, true);
-}
-
 static char *opt_add_announce_addr(const char *arg, struct lightningd *ld)
 {
 	const struct wireaddr *wn;
 	size_t n = tal_count(ld->proposed_wireaddr);
-	char *err = opt_add_addr_withtype(arg, ld, ADDR_ANNOUNCE, false);
+	char *err;
+
+	/* Check for autotor and reroute the call to --addr  */
+	if (strstarts(arg, "autotor:"))
+		return opt_add_addr(arg, ld);
+
+	/* Check for statictor and reroute the call to --addr  */
+	if (strstarts(arg, "statictor:"))
+		return opt_add_addr(arg, ld);
+
+	err = opt_add_addr_withtype(arg, ld, ADDR_ANNOUNCE, false);
 	if (err)
 		return err;
 
@@ -189,6 +196,73 @@ static char *opt_add_announce_addr(const char *arg, struct lightningd *ld)
 	return NULL;
 }
 
+static char *opt_add_addr(const char *arg, struct lightningd *ld)
+{
+	struct wireaddr_internal addr;
+
+	/* handle in case you used the addr option with an .onion */
+	if (parse_wireaddr_internal(arg, &addr, 0, true, false, true, NULL)) {
+		if (addr.itype == ADDR_INTERNAL_WIREADDR && (
+			addr.u.wireaddr.type == ADDR_TYPE_TOR_V2 ||
+			addr.u.wireaddr.type == ADDR_TYPE_TOR_V3)) {
+				log_unusual(ld->log, "You used `--addr=%s` option with an .onion address, please use"
+							" `--announce-addr` ! You are lucky in this node live some wizards and"
+							" fairies, we have done this for you and announce, Be as hidden as wished",
+							arg);
+				return opt_add_announce_addr(arg, ld);
+		}
+	}
+	/* the intended call */
+	return opt_add_addr_withtype(arg, ld, ADDR_LISTEN_AND_ANNOUNCE, true);
+}
+
+static char *opt_subdaemon(const char *arg, struct lightningd *ld)
+{
+	char *subdaemon;
+	char *sdpath;
+
+	/* example arg: "hsmd:remote_hsmd" */
+
+	size_t colonoff = strcspn(arg, ":");
+	if (!arg[colonoff])
+		return tal_fmt(NULL, "argument must contain ':'");
+
+	subdaemon = tal_strndup(ld, arg, colonoff);
+	if (!is_subdaemon(subdaemon))
+		return tal_fmt(NULL, "\"%s\" is not a subdaemon", subdaemon);
+
+	/* Make the value a tal-child of the subdaemon */
+	sdpath = tal_strdup(subdaemon, arg + colonoff + 1);
+
+	/* Remove any preexisting alt subdaemon mapping (and
+	 * implicitly, the sdpath). */
+	tal_free(strmap_del(&ld->alt_subdaemons, subdaemon, NULL));
+
+	strmap_add(&ld->alt_subdaemons, subdaemon, sdpath);
+
+	return NULL;
+}
+
+static char *opt_add_bind_addr(const char *arg, struct lightningd *ld)
+{
+	struct wireaddr_internal addr;
+
+	/* handle in case you used the bind option with an .onion */
+	if (parse_wireaddr_internal(arg, &addr, 0, true, false, true, NULL)) {
+		if (addr.itype == ADDR_INTERNAL_WIREADDR && (
+			addr.u.wireaddr.type == ADDR_TYPE_TOR_V2 ||
+			addr.u.wireaddr.type == ADDR_TYPE_TOR_V3)) {
+				log_unusual(ld->log, "You used `--bind-addr=%s` option with an .onion address,"
+							" You are lucky in this node live some wizards and"
+							" fairies, we have done this for you and don't announce, Be as hidden as wished",
+							arg);
+				return NULL;
+		}
+	}
+	/* the intended call */
+	return opt_add_addr_withtype(arg, ld, ADDR_LISTEN, true);
+}
+
 static void opt_show_u64(char buf[OPT_SHOW_LEN], const u64 *u)
 {
 	snprintf(buf, OPT_SHOW_LEN, "%"PRIu64, *u);
@@ -203,30 +277,9 @@ static void opt_show_s32(char buf[OPT_SHOW_LEN], const s32 *u)
 	snprintf(buf, OPT_SHOW_LEN, "%"PRIi32, *u);
 }
 
-static char *opt_set_network(const char *arg, struct lightningd *ld)
+static void opt_show_mode(char buf[OPT_SHOW_LEN], const mode_t *m)
 {
-	assert(arg != NULL);
-
-	ld->topology->bitcoind->chainparams = chainparams_for_network(arg);
-	if (!ld->topology->bitcoind->chainparams)
-		return tal_fmt(NULL, "Unknown network name '%s'", arg);
-	return NULL;
-}
-
-static char *opt_set_testnet(struct lightningd *ld)
-{
-	return opt_set_network("testnet", ld);
-}
-
-static char *opt_set_mainnet(struct lightningd *ld)
-{
-	return opt_set_network("bitcoin", ld);
-}
-
-static void opt_show_network(char buf[OPT_SHOW_LEN],
-			     const struct lightningd *ld)
-{
-	snprintf(buf, OPT_SHOW_LEN, "%s", get_chainparams(ld)->network_name);
+	snprintf(buf, OPT_SHOW_LEN, "\"%04o\"", (int) *m);
 }
 
 static char *opt_set_rgb(const char *arg, struct lightningd *ld)
@@ -252,7 +305,7 @@ static char *opt_set_alias(const char *arg, struct lightningd *ld)
 	ld->alias = tal_free(ld->alias);
 	/* BOLT #7:
 	 *
-	 *    * [`32`:`alias`]
+	 *    * [`32*byte`:`alias`]
 	 *...
 	 *  - MUST set `alias` to a valid UTF-8 string, with any
 	 *   `alias` trailing-bytes equal to 0.
@@ -291,15 +344,18 @@ static char *opt_add_proxy_addr(const char *arg, struct lightningd *ld)
 
 static char *opt_add_plugin(const char *arg, struct lightningd *ld)
 {
-	plugin_register(ld->plugins, arg);
+	if (plugin_blacklisted(ld->plugins, arg)) {
+		log_info(ld->log, "%s: disabled via disable-plugin", arg);
+		return NULL;
+	}
+	plugin_register(ld->plugins, arg, NULL);
 	return NULL;
 }
 
 static char *opt_disable_plugin(const char *arg, struct lightningd *ld)
 {
-	if (plugin_remove(ld->plugins, arg))
-		return NULL;
-	return tal_fmt(NULL, "Could not find plugin %s", arg);
+	plugin_blacklist(ld->plugins, arg);
+	return NULL;
 }
 
 static char *opt_add_plugin_dir(const char *arg, struct lightningd *ld)
@@ -313,127 +369,62 @@ static char *opt_clear_plugins(struct lightningd *ld)
 	return NULL;
 }
 
-static void config_register_opts(struct lightningd *ld)
+/* Prompt the user to enter a password, from which will be derived the key used
+ * for `hsm_secret` encryption.
+ * The algorithm used to derive the key is Argon2(id), to which libsodium
+ * defaults. However argon2id-specific constants are used in case someone runs it
+ * with a libsodium version which default constants differs (typically <1.0.9).
+ */
+static char *opt_set_hsm_password(struct lightningd *ld)
 {
-	opt_register_early_arg("--conf=<file>", opt_set_talstr, NULL,
-		&ld->config_filename,
-		"Specify configuration file. Relative paths will be prefixed by lightning-dir location. (default: config)");
+	struct termios current_term, temp_term;
+	char *passwd = NULL;
+	size_t passwd_size = 0;
+	u8 salt[16] = "c-lightning\0\0\0\0\0";
+	ld->encrypted_hsm = true;
 
-	/* Register plugins as an early args, so we can initialize them and have
-	 * them register more command line options */
-	opt_register_early_arg("--plugin", opt_add_plugin, NULL, ld,
-			       "Add a plugin to be run (can be used multiple times)");
-	opt_register_early_arg("--plugin-dir", opt_add_plugin_dir,
-			       NULL, ld,
-			       "Add a directory to load plugins from (can be used multiple times)");
-	opt_register_early_noarg("--clear-plugins", opt_clear_plugins,
-				 ld,
-				 "Remove all plugins added before this option");
-	opt_register_early_arg("--disable-plugin", opt_disable_plugin,
-			       NULL, ld,
-			       "Disable a particular plugin by filename/name");
+	ld->config.keypass = tal(NULL, struct secret);
+	/* Don't swap the encryption key ! */
+	if (sodium_mlock(ld->config.keypass->data,
+	                 sizeof(ld->config.keypass->data)) != 0)
+		return "Could not lock hsm_secret encryption key memory.";
 
-	opt_register_noarg("--daemon", opt_set_bool, &ld->daemon,
-			 "Run in the background, suppress stdout/stderr");
-	opt_register_arg("--ignore-fee-limits", opt_set_bool_arg, opt_show_bool,
-			 &ld->config.ignore_fee_limits,
-			 "(DANGEROUS) allow peer to set any feerate");
-	opt_register_arg("--watchtime-blocks", opt_set_u32, opt_show_u32,
-			 &ld->config.locktime_blocks,
-			 "Blocks before peer can unilaterally spend funds");
-	opt_register_arg("--max-locktime-blocks", opt_set_u32, opt_show_u32,
-			 &ld->config.locktime_max,
-			 "Maximum blocks funds may be locked for");
-	opt_register_arg("--funding-confirms", opt_set_u32, opt_show_u32,
-			 &ld->config.anchor_confirms,
-			 "Confirmations required for funding transaction");
-	opt_register_arg("--commit-fee-min=<percent>", opt_set_u32, opt_show_u32,
-			 &ld->config.commitment_fee_min_percent,
-			 "Minimum percentage of fee to accept for commitment");
-	opt_register_arg("--commit-fee-max=<percent>", opt_set_u32, opt_show_u32,
-			 &ld->config.commitment_fee_max_percent,
-			 "Maximum percentage of fee to accept for commitment (0 for unlimited)");
-	opt_register_arg("--commit-fee=<percent>", opt_set_u32, opt_show_u32,
-			 &ld->config.commitment_fee_percent,
-			 "Percentage of fee to request for their commitment");
-	opt_register_arg("--cltv-delta", opt_set_u32, opt_show_u32,
-			 &ld->config.cltv_expiry_delta,
-			 "Number of blocks for cltv_expiry_delta");
-	opt_register_arg("--cltv-final", opt_set_u32, opt_show_u32,
-			 &ld->config.cltv_final,
-			 "Number of blocks for final cltv_expiry");
-	opt_register_arg("--commit-time=<millseconds>",
-			 opt_set_u32, opt_show_u32,
-			 &ld->config.commit_time_ms,
-			 "Time after changes before sending out COMMIT");
-	opt_register_arg("--fee-base", opt_set_u32, opt_show_u32,
-			 &ld->config.fee_base,
-			 "Millisatoshi minimum to charge for HTLC");
-	opt_register_arg("--rescan", opt_set_s32, opt_show_s32,
-			 &ld->config.rescan,
-			 "Number of blocks to rescan from the current head, or "
-			 "absolute blockheight if negative");
-	opt_register_arg("--fee-per-satoshi", opt_set_u32, opt_show_u32,
-			 &ld->config.fee_per_satoshi,
-			 "Microsatoshi fee for every satoshi in HTLC");
-	opt_register_arg("--addr", opt_add_addr, NULL,
-			 ld,
-			 "Set an IP address (v4 or v6) to listen on and announce to the network for incoming connections");
-	opt_register_arg("--bind-addr", opt_add_bind_addr, NULL,
-			 ld,
-			 "Set an IP address (v4 or v6) to listen on, but not announce");
-	opt_register_arg("--announce-addr", opt_add_announce_addr, NULL,
-			 ld,
-			 "Set an IP address (v4 or v6) or .onion v2/v3 to announce, but not listen on");
+	/* Get the password from stdin, but don't echo it. */
+	if (tcgetattr(fileno(stdin), &current_term) != 0)
+		return "Could not get current terminal options.";
+	temp_term = current_term;
+	temp_term.c_lflag &= ~ECHO;
+	if (tcsetattr(fileno(stdin), TCSAFLUSH, &temp_term) != 0)
+		return "Could not disable password echoing.";
+	printf("The hsm_secret is encrypted with a password. In order to "
+	       "decrypt it and start the node you must provide the password.\n");
+	printf("Enter hsm_secret password: ");
+	/* If we don't flush we might end up being buffered and we might seem
+	 * to hang while we wait for the password. */
+	fflush(stdout);
+	if (getline(&passwd, &passwd_size, stdin) < 0)
+		return "Could not read password from stdin.";
+	if (passwd[strlen(passwd) - 1] == '\n')
+		passwd[strlen(passwd) - 1] = '\0';
+	if (tcsetattr(fileno(stdin), TCSAFLUSH, &current_term) != 0)
+		return "Could not restore terminal options.";
+	printf("\n");
 
-	opt_register_noarg("--offline", opt_set_offline, ld,
-			   "Start in offline-mode (do not automatically reconnect and do not accept incoming connections)");
-	opt_register_arg("--autolisten", opt_set_bool_arg, opt_show_bool,
-			 &ld->autolisten,
-			 "If true, listen on default port and announce if it seems to be a public interface");
-
-	opt_register_early_arg("--network", opt_set_network, opt_show_network,
-			       ld,
-			       "Select the network parameters (bitcoin, testnet,"
-			       " regtest, litecoin or litecoin-testnet)");
-	opt_register_early_noarg("--testnet", opt_set_testnet, ld,
-				 "Alias for --network=testnet");
-	opt_register_early_noarg("--mainnet", opt_set_mainnet, ld,
-				 "Alias for --network=bitcoin");
-	opt_register_early_arg("--allow-deprecated-apis",
-			       opt_set_bool_arg, opt_show_bool,
-			       &deprecated_apis,
-			       "Enable deprecated options, JSONRPC commands, fields, etc.");
-	opt_register_arg("--autocleaninvoice-cycle",
-			 opt_set_u64, opt_show_u64,
-			 &ld->ini_autocleaninvoice_cycle,
-			 "Perform cleanup of expired invoices every given seconds, or do not autoclean if 0");
-	opt_register_arg("--autocleaninvoice-expired-by",
-			 opt_set_u64, opt_show_u64,
-			 &ld->ini_autocleaninvoice_expiredby,
-			 "If expired invoice autoclean enabled, invoices that have expired for at least this given seconds are cleaned");
-	opt_register_arg("--proxy", opt_add_proxy_addr, NULL,
-			ld,"Set a socks v5 proxy IP address and port");
-	opt_register_arg("--tor-service-password", opt_set_talstr, NULL,
-			 &ld->tor_service_password,
-			 "Set a Tor hidden service password");
-
-	/* Early, as it suppresses DNS lookups from cmdline too. */
-	opt_register_early_arg("--always-use-proxy",
-			       opt_set_bool_arg, opt_show_bool,
-			       &ld->use_proxy_always, "Use the proxy always");
-
-	opt_register_noarg("--disable-dns", opt_set_invbool, &ld->config.use_dns,
-			   "Disable DNS lookups of peers");
-
-#if DEVELOPER
-	opt_register_arg("--dev-max-funding-unconfirmed-blocks",
-			 opt_set_u32, opt_show_u32,
-			 &ld->max_funding_unconfirmed,
-			 "Maximum number of blocks we wait for a channel "
-			 "funding transaction to confirm, if we are the "
-			 "fundee.");
-#endif
+	/* Derive the key from the password. */
+	if (strlen(passwd) < crypto_pwhash_argon2id_PASSWD_MIN)
+		return "Password too short to be able to derive a key from it.";
+	if (strlen(passwd) > crypto_pwhash_argon2id_PASSWD_MAX)
+		return "Password too long to be able to derive a key from it.";
+	if (crypto_pwhash(ld->config.keypass->data, sizeof(ld->config.keypass->data),
+	                  passwd, strlen(passwd), salt,
+	                  /* INTERACTIVE needs 64 MiB of RAM, MODERATE needs 256,
+	                   * and SENSITIVE needs 1024. */
+	                  crypto_pwhash_argon2id_OPSLIMIT_MODERATE,
+	                  crypto_pwhash_argon2id_MEMLIMIT_MODERATE,
+	                  crypto_pwhash_ALG_ARGON2ID13) != 0)
+		return "Could not derive a key from the password.";
+	free(passwd);
+	return NULL;
 }
 
 #if DEVELOPER
@@ -443,18 +434,86 @@ static char *opt_subprocess_debug(const char *optarg, struct lightningd *ld)
 	return NULL;
 }
 
+static char *opt_force_privkey(const char *optarg, struct lightningd *ld)
+{
+	tal_free(ld->dev_force_privkey);
+	ld->dev_force_privkey = tal(ld, struct privkey);
+	if (!hex_decode(optarg, strlen(optarg),
+			ld->dev_force_privkey, sizeof(*ld->dev_force_privkey)))
+		return tal_fmt(NULL, "Unable to parse privkey '%s'", optarg);
+	return NULL;
+}
+
+static char *opt_force_bip32_seed(const char *optarg, struct lightningd *ld)
+{
+	tal_free(ld->dev_force_bip32_seed);
+	ld->dev_force_bip32_seed = tal(ld, struct secret);
+	if (!hex_decode(optarg, strlen(optarg),
+			ld->dev_force_bip32_seed,
+			sizeof(*ld->dev_force_bip32_seed)))
+		return tal_fmt(NULL, "Unable to parse secret '%s'", optarg);
+	return NULL;
+}
+
+static char *opt_force_tmp_channel_id(const char *optarg, struct lightningd *ld)
+{
+	tal_free(ld->dev_force_tmp_channel_id);
+	ld->dev_force_tmp_channel_id = tal(ld, struct channel_id);
+	if (!hex_decode(optarg, strlen(optarg),
+			ld->dev_force_tmp_channel_id,
+			sizeof(*ld->dev_force_tmp_channel_id)))
+		return tal_fmt(NULL, "Unable to parse channel id '%s'", optarg);
+	return NULL;
+}
+
+static char *opt_force_channel_secrets(const char *optarg,
+				       struct lightningd *ld)
+{
+	char **strs;
+	tal_free(ld->dev_force_channel_secrets);
+	tal_free(ld->dev_force_channel_secrets_shaseed);
+	ld->dev_force_channel_secrets = tal(ld, struct secrets);
+	ld->dev_force_channel_secrets_shaseed = tal(ld, struct sha256);
+
+	strs = tal_strsplit(tmpctx, optarg, "/", STR_EMPTY_OK);
+	if (tal_count(strs) != 7) /* Last is NULL */
+		return "Expected 6 hex secrets separated by /";
+
+	if (!hex_decode(strs[0], strlen(strs[0]),
+			&ld->dev_force_channel_secrets->funding_privkey,
+			sizeof(ld->dev_force_channel_secrets->funding_privkey))
+	    || !hex_decode(strs[1], strlen(strs[1]),
+			   &ld->dev_force_channel_secrets->revocation_basepoint_secret,
+			   sizeof(ld->dev_force_channel_secrets->revocation_basepoint_secret))
+	    || !hex_decode(strs[2], strlen(strs[2]),
+			   &ld->dev_force_channel_secrets->payment_basepoint_secret,
+			   sizeof(ld->dev_force_channel_secrets->payment_basepoint_secret))
+	    || !hex_decode(strs[3], strlen(strs[3]),
+			   &ld->dev_force_channel_secrets->delayed_payment_basepoint_secret,
+			   sizeof(ld->dev_force_channel_secrets->delayed_payment_basepoint_secret))
+	    || !hex_decode(strs[4], strlen(strs[4]),
+			   &ld->dev_force_channel_secrets->htlc_basepoint_secret,
+			   sizeof(ld->dev_force_channel_secrets->htlc_basepoint_secret))
+	    || !hex_decode(strs[5], strlen(strs[5]),
+			   ld->dev_force_channel_secrets_shaseed,
+			   sizeof(*ld->dev_force_channel_secrets_shaseed)))
+		return "Expected 6 hex secrets separated by /";
+
+	return NULL;
+}
+
 static void dev_register_opts(struct lightningd *ld)
 {
-	opt_register_noarg("--dev-no-reconnect", opt_set_invbool,
-			   &ld->reconnect,
-			   "Disable automatic reconnect attempts");
-	opt_register_noarg("--dev-fail-on-subdaemon-fail", opt_set_bool,
-			   &ld->dev_subdaemon_fail, opt_hidden);
+	/* We might want to debug plugins, which are started before normal
+	 * option parsing */
 	opt_register_early_arg("--dev-debugger=<subprocess>", opt_subprocess_debug, NULL,
 			 ld, "Invoke gdb at start of <subprocess>");
-	opt_register_arg("--dev-broadcast-interval=<ms>", opt_set_uintval,
-			 opt_show_uintval, &ld->config.broadcast_interval_msec,
-			 "Time between gossip broadcasts in milliseconds");
+
+	opt_register_noarg("--dev-no-reconnect", opt_set_invbool,
+			   &ld->reconnect,
+			   "Disable automatic reconnect-attempts by this node, but accept incoming");
+	opt_register_noarg("--dev-fail-on-subdaemon-fail", opt_set_bool,
+			   &ld->dev_subdaemon_fail, opt_hidden);
 	opt_register_arg("--dev-disconnect=<filename>", opt_subd_dev_disconnect,
 			 NULL, ld, "File containing disconnection points");
 	opt_register_noarg("--dev-allow-localhost", opt_set_bool,
@@ -463,20 +522,39 @@ static void dev_register_opts(struct lightningd *ld)
 	opt_register_arg("--dev-bitcoind-poll", opt_set_u32, opt_show_u32,
 			 &ld->topology->poll_seconds,
 			 "Time between polling for new transactions");
-	opt_register_arg("--dev-max-fee-multiplier", opt_set_u32, opt_show_u32,
-			 &ld->config.max_fee_multiplier,
-			 "Allow the fee proposed by the remote end to be up to "
-			 "multiplier times higher than our own. Small values "
-			 "will cause channels to be closed more often due to "
-			 "fee fluctuations, large values may result in large "
-			 "fees.");
 
-	opt_register_arg(
-	    "--dev-channel-update-interval=<s>", opt_set_u32, opt_show_u32,
-	    &ld->config.channel_update_interval,
-	    "Time in seconds between channel updates for our own channels.");
+	opt_register_noarg("--dev-fast-gossip", opt_set_bool,
+			   &ld->dev_fast_gossip,
+			   "Make gossip broadcast 1 second, etc");
+	opt_register_noarg("--dev-fast-gossip-prune", opt_set_bool,
+			   &ld->dev_fast_gossip_prune,
+			   "Make gossip pruning 30 seconds");
+
+	opt_register_arg("--dev-gossip-time", opt_set_u32, opt_show_u32,
+			 &ld->dev_gossip_time,
+			 "UNIX time to override gossipd to use.");
+	opt_register_arg("--dev-force-privkey", opt_force_privkey, NULL, ld,
+			 "Force HSM to use this as node private key");
+	opt_register_arg("--dev-force-bip32-seed", opt_force_bip32_seed, NULL, ld,
+			 "Force HSM to use this as bip32 seed");
+	opt_register_arg("--dev-force-channel-secrets", opt_force_channel_secrets, NULL, ld,
+			 "Force HSM to use these for all per-channel secrets");
+	opt_register_arg("--dev-max-funding-unconfirmed-blocks",
+			 opt_set_u32, opt_show_u32,
+			 &ld->max_funding_unconfirmed,
+			 "Maximum number of blocks we wait for a channel "
+			 "funding transaction to confirm, if we are the "
+			 "fundee.");
+	opt_register_arg("--dev-force-tmp-channel-id", opt_force_tmp_channel_id, NULL, ld,
+			 "Force the temporary channel id, instead of random");
+	opt_register_noarg("--dev-no-htlc-timeout", opt_set_bool,
+			   &ld->dev_no_htlc_timeout,
+			   "Don't kill channeld if HTLCs not confirmed within 30 seconds");
+	opt_register_noarg("--dev-fail-process-onionpacket", opt_set_bool,
+			   &dev_fail_process_onionpacket,
+			   "Force all processing of onion packets to fail");
 }
-#endif
+#endif /* DEVELOPER */
 
 static const struct config testnet_config = {
 	/* 6 blocks to catch cheating attempts. */
@@ -493,8 +571,8 @@ static const struct config testnet_config = {
 	.commitment_fee_min_percent = 0,
 	.commitment_fee_max_percent = 0,
 
-	/* We offer to pay 5 times 2-block fee */
-	.commitment_fee_percent = 500,
+	/* Testnet blockspace is free. */
+	.max_concurrent_htlcs = 483,
 
 	/* Be aggressive on testnet. */
 	.cltv_expiry_delta = 6,
@@ -508,26 +586,18 @@ static const struct config testnet_config = {
 	/* Take 0.001% */
 	.fee_per_satoshi = 10,
 
-	/* BOLT #7:
-	 *
-	 *   - SHOULD flush outgoing gossip messages once every 60
-	 *     seconds, independently of the arrival times of the messages.
-	 */
-	.broadcast_interval_msec = 60000,
-
-	/* Send a keepalive update at least every week, prune every twice that */
-	.channel_update_interval = 1209600/2,
-
 	/* Testnet sucks */
 	.ignore_fee_limits = true,
 
 	/* Rescan 5 hours of blocks on testnet, it's reorg happy */
 	.rescan = 30,
 
-	/* Fees may be in the range our_fee - 10*our_fee */
-	.max_fee_multiplier = 10,
-
 	.use_dns = true,
+
+	/* Sets min_effective_htlc_capacity - at 1000$/BTC this is 10ct */
+	.min_capacity_sat = 10000,
+
+	.use_v3_autotor = true,
 };
 
 /* aka. "Dude, where's my coins?" */
@@ -546,8 +616,8 @@ static const struct config mainnet_config = {
 	.commitment_fee_min_percent = 200,
 	.commitment_fee_max_percent = 2000,
 
-	/* We offer to pay 5 times 2-block fee */
-	.commitment_fee_percent = 500,
+	/* While up to 483 htlcs are possible we do 30 by default (as eclair does) to save blockspace */
+	.max_concurrent_htlcs = 30,
 
 	/* BOLT #2:
 	 *
@@ -571,26 +641,19 @@ static const struct config mainnet_config = {
 	/* Take 0.001% */
 	.fee_per_satoshi = 10,
 
-	/* BOLT #7:
-	 *
-	 *   - SHOULD flush outgoing gossip messages once every 60
-	 *     seconds, independently of the arrival times of the messages.
-	 */
-	.broadcast_interval_msec = 60000,
-
-	/* Send a keepalive update at least every week, prune every twice that */
-	.channel_update_interval = 1209600/2,
-
 	/* Mainnet should have more stable fees */
 	.ignore_fee_limits = false,
 
 	/* Rescan 2.5 hours of blocks on startup, it's not so reorg happy */
 	.rescan = 15,
 
-	/* Fees may be in the range our_fee - 10*our_fee */
-	.max_fee_multiplier = 10,
-
 	.use_dns = true,
+
+	/* Sets min_effective_htlc_capacity - at 1000$/BTC this is 10ct */
+	.min_capacity_sat = 10000,
+
+	/* Allow to define the default behavior of tor services calls*/
+	.use_v3_autotor = true,
 };
 
 static void check_config(struct lightningd *ld)
@@ -602,137 +665,20 @@ static void check_config(struct lightningd *ld)
 		fatal("Commitment fee invalid min-max %u-%u",
 		      ld->config.commitment_fee_min_percent,
 		      ld->config.commitment_fee_max_percent);
-
+	/* BOLT #2:
+	 *
+	 * The receiving node MUST fail the channel if:
+	 *...
+	 *   - `max_accepted_htlcs` is greater than 483.
+	 */
+	if (ld->config.max_concurrent_htlcs < 1 || ld->config.max_concurrent_htlcs > 483)
+		fatal("--max-concurrent-htlcs value must be between 1 and 483 it is: %u",
+		      ld->config.max_concurrent_htlcs);
 	if (ld->config.anchor_confirms == 0)
 		fatal("anchor-confirms must be greater than zero");
 
 	if (ld->use_proxy_always && !ld->proxyaddr)
 		fatal("--always-use-proxy needs --proxy");
-}
-
-static void setup_default_config(struct lightningd *ld)
-{
-	if (get_chainparams(ld)->testnet)
-		ld->config = testnet_config;
-	else
-		ld->config = mainnet_config;
-
-	/* Set default PID file name to be per-network */
-	tal_free(ld->pidfile);
-	ld->pidfile = tal_fmt(ld, "lightningd-%s.pid", get_chainparams(ld)->network_name);
-}
-
-
-/* FIXME: make this nicer! */
-static int config_parse_line_number = 0;
-
-static void config_log_stderr_exit(const char *fmt, ...)
-{
-	char *msg;
-	va_list ap;
-
-	va_start(ap, fmt);
-
-	/* This is the format we expect:*/
-	if (streq(fmt, "%s: %.*s: %s")) {
-		const char *argv0 = va_arg(ap, const char *);
-		unsigned int len = va_arg(ap, unsigned int);
-		const char *arg = va_arg(ap, const char *);
-		const char *problem = va_arg(ap, const char *);
-
-		assert(argv0 != NULL);
-		assert(arg != NULL);
-		assert(problem != NULL);
-		/*mangle it to remove '--' and add the line number.*/
-		msg = tal_fmt(NULL, "%s line %d: %.*s: %s",
-			      argv0, config_parse_line_number, len-2, arg+2, problem);
-	} else {
-		msg = tal_vfmt(NULL, fmt, ap);
-	}
-	va_end(ap);
-
-	fatal("%s", msg);
-}
-
-/**
- * We turn the config file into cmdline arguments. @early tells us
- * whether to parse early options only, or the non-early options.
- */
-static void opt_parse_from_config(struct lightningd *ld, bool early)
-{
-	char *contents, **lines;
-	char **all_args; /*For each line: either argument string or NULL*/
-	char *argv[3];
-	int i, argc;
-	char *filename;
-
-	if (ld->config_filename != NULL)
-		filename = ld->config_filename;
-	else
-		filename = path_join(tmpctx, ld->config_dir, "config");
-
-	contents = grab_file(ld, filename);
-
-	/* The default config doesn't have to exist, but if the config was
-	 * specified on the command line it has to exist. */
-	if (!contents) {
-		if ((errno != ENOENT) || (ld->config_filename != NULL))
-			fatal("Opening and reading %s: %s",
-			      filename, strerror(errno));
-		/* Now we can set up defaults, since no config file. */
-		setup_default_config(ld);
-		return;
-	}
-
-	lines = tal_strsplit(contents, contents, "\r\n", STR_NO_EMPTY);
-
-	/* We have to keep all_args around, since opt will point into it */
-	all_args = notleak(tal_arr(ld, char *, tal_count(lines) - 1));
-
-	for (i = 0; i < tal_count(lines) - 1; i++) {
-		if (strstarts(lines[i], "#")) {
-			all_args[i] = NULL;
-		}
-		else {
-			/* Only valid forms are "foo" and "foo=bar" */
-			all_args[i] = tal_fmt(all_args, "--%s", lines[i]);
-		}
-	}
-
-	/*
-	For each line we construct a fake argc,argv commandline.
-	argv[1] is the only element that changes between iterations.
-	*/
-	argc = 2;
-	argv[0] = "lightning config file";
-	argv[argc] = NULL;
-
-	if (early) {
-		for (i = 0; i < tal_count(all_args); i++) {
-			if (all_args[i] != NULL) {
-				config_parse_line_number = i + 1;
-				argv[1] = all_args[i];
-				opt_early_parse(argc, argv,
-						config_log_stderr_exit);
-			}
-		}
-
-		/* Now we can set up defaults, depending on whether testnet or
-		 * not */
-		setup_default_config(ld);
-	} else {
-
-		for (i = 0; i < tal_count(all_args); i++) {
-			if (all_args[i] != NULL) {
-				config_parse_line_number = i + 1;
-				argv[1] = all_args[i];
-				opt_parse(&argc, argv, config_log_stderr_exit);
-				argc = 2; /* opt_parse might have changed it  */
-			}
-		}
-	}
-
-	tal_free(contents);
 }
 
 static char *test_subdaemons_and_exit(struct lightningd *ld)
@@ -742,64 +688,277 @@ static char *test_subdaemons_and_exit(struct lightningd *ld)
 	return NULL;
 }
 
+static char *list_features_and_exit(struct lightningd *ld)
+{
+	const char **features = list_supported_features(tmpctx, ld->our_features);
+	for (size_t i = 0; i < tal_count(features); i++)
+		printf("%s\n", features[i]);
+	exit(0);
+}
+
 static char *opt_lightningd_usage(struct lightningd *ld)
 {
-	/* Reload config so that --help has the correct network defaults
-	 * to display before it exits */
-	setup_default_config(ld);
 	char *extra = tal_fmt(NULL, "\nA bitcoin lightning daemon (default "
-			"values shown for network: %s).",
-	                get_chainparams(ld)->network_name);
+			"values shown for network: %s).", chainparams->network_name);
 	opt_usage_and_exit(extra);
 	tal_free(extra);
 	return NULL;
 }
 
-void register_opts(struct lightningd *ld)
+static char *opt_start_daemon(struct lightningd *ld)
 {
-	opt_set_alloc(opt_allocfn, tal_reallocfn, tal_freefn);
+	int fds[2];
+	int exitcode, pid;
 
-	opt_register_noarg("--help|-h", opt_lightningd_usage, ld,
-				 "Print this message.");
+	/* Already a daemon?  OK. */
+	if (ld->daemon_parent_fd != -1)
+		return NULL;
+
+	if (pipe(fds) != 0)
+		err(1, "Creating pipe to talk to --daemon");
+
+	pid = fork();
+	if (pid == -1)
+		err(1, "Fork failed for --daemon");
+
+	if (pid == 0) {
+		/* Child returns, continues as normal. */
+		close(fds[0]);
+		ld->daemon_parent_fd = fds[1];
+		return NULL;
+	}
+
+	/* OK, we are the parent.  We exit with status told to us by
+	 * child. */
+	close(fds[1]);
+	if (read(fds[0], &exitcode, sizeof(exitcode)) == sizeof(exitcode))
+		_exit(exitcode);
+	/* It died before writing exitcode (presumably 0), so we grab it */
+	waitpid(pid, &exitcode, 0);
+	if (WIFEXITED(exitcode))
+		_exit(WEXITSTATUS(exitcode));
+	errx(1, "Died with signal %u", WTERMSIG(exitcode));
+}
+
+static char *opt_set_wumbo(struct lightningd *ld)
+{
+	feature_set_or(ld->our_features,
+		       take(feature_set_for_feature(NULL,
+						    OPTIONAL_FEATURE(OPT_LARGE_CHANNELS))));
+	return NULL;
+}
+
+static void register_opts(struct lightningd *ld)
+{
+	/* This happens before plugins started */
 	opt_register_early_noarg("--test-daemons-only",
 				 test_subdaemons_and_exit,
 				 ld, opt_hidden);
+	/* Register plugins as an early args, so we can initialize them and have
+	 * them register more command line options */
+	opt_register_early_arg("--plugin", opt_add_plugin, NULL, ld,
+			       "Add a plugin to be run (can be used multiple times)");
+	opt_register_early_arg("--plugin-dir", opt_add_plugin_dir,
+			       NULL, ld,
+			       "Add a directory to load plugins from (can be used multiple times)");
+	opt_register_early_noarg("--clear-plugins", opt_clear_plugins,
+				 ld,
+				 "Remove all plugins added before this option");
+	opt_register_early_arg("--disable-plugin", opt_disable_plugin,
+			       NULL, ld,
+			       "Disable a particular plugin by filename/name");
 
-	opt_register_arg("--bitcoin-datadir", opt_set_talstr, NULL,
-			 &ld->topology->bitcoind->datadir,
-			 "-datadir arg for bitcoin-cli");
+	/* Early, as it suppresses DNS lookups from cmdline too. */
+	opt_register_early_arg("--always-use-proxy",
+			       opt_set_bool_arg, opt_show_bool,
+			       &ld->use_proxy_always, "Use the proxy always");
+
+	/* This immediately makes is a daemon. */
+	opt_register_early_noarg("--daemon", opt_start_daemon, ld,
+				 "Run in the background, suppress stdout/stderr");
+	opt_register_early_arg("--wallet", opt_set_talstr, NULL,
+			       &ld->wallet_dsn,
+			       "Location of the wallet database.");
+
+	/* This affects our features, so set early. */
+	opt_register_early_noarg("--large-channels|--wumbo",
+				 opt_set_wumbo, ld,
+				 "Allow channels larger than 0.16777215 BTC");
+
+	opt_register_noarg("--help|-h", opt_lightningd_usage, ld,
+				 "Print this message.");
 	opt_register_arg("--rgb", opt_set_rgb, NULL, ld,
 			 "RRGGBB hex color for node");
 	opt_register_arg("--alias", opt_set_alias, NULL, ld,
 			 "Up to 32-byte alias for node");
 
-	opt_register_arg("--bitcoin-cli", opt_set_talstr, NULL,
-			 &ld->topology->bitcoind->cli,
-			 "bitcoin-cli pathname");
-	opt_register_arg("--bitcoin-rpcuser", opt_set_talstr, NULL,
-			 &ld->topology->bitcoind->rpcuser,
-			 "bitcoind RPC username");
-	opt_register_arg("--bitcoin-rpcpassword", opt_set_talstr, NULL,
-			 &ld->topology->bitcoind->rpcpass,
-			 "bitcoind RPC password");
-	opt_register_arg("--bitcoin-rpcconnect", opt_set_talstr, NULL,
-			 &ld->topology->bitcoind->rpcconnect,
-			 "bitcoind RPC host to connect to");
-	opt_register_arg("--bitcoin-rpcport", opt_set_talstr, NULL,
-			 &ld->topology->bitcoind->rpcport,
-			 "bitcoind RPC port");
 	opt_register_arg("--pid-file=<file>", opt_set_talstr, opt_show_charp,
 			 &ld->pidfile,
 			 "Specify pid file");
 
+	opt_register_arg("--ignore-fee-limits", opt_set_bool_arg, opt_show_bool,
+			 &ld->config.ignore_fee_limits,
+			 "(DANGEROUS) allow peer to set any feerate");
+	opt_register_arg("--watchtime-blocks", opt_set_u32, opt_show_u32,
+			 &ld->config.locktime_blocks,
+			 "Blocks before peer can unilaterally spend funds");
+	opt_register_arg("--max-locktime-blocks", opt_set_u32, opt_show_u32,
+			 &ld->config.locktime_max,
+			 "Maximum blocks funds may be locked for");
+	opt_register_arg("--funding-confirms", opt_set_u32, opt_show_u32,
+			 &ld->config.anchor_confirms,
+			 "Confirmations required for funding transaction");
+	opt_register_arg("--commit-fee-min=<percent>", opt_set_u32, opt_show_u32,
+			 &ld->config.commitment_fee_min_percent,
+			 "Minimum percentage of fee to accept for commitment");
+	opt_register_arg("--commit-fee-max=<percent>", opt_set_u32, opt_show_u32,
+			 &ld->config.commitment_fee_max_percent,
+			 "Maximum percentage of fee to accept for commitment (0 for unlimited)");
+	opt_register_arg("--cltv-delta", opt_set_u32, opt_show_u32,
+			 &ld->config.cltv_expiry_delta,
+			 "Number of blocks for cltv_expiry_delta");
+	opt_register_arg("--cltv-final", opt_set_u32, opt_show_u32,
+			 &ld->config.cltv_final,
+			 "Number of blocks for final cltv_expiry");
+	opt_register_arg("--commit-time=<millseconds>",
+			 opt_set_u32, opt_show_u32,
+			 &ld->config.commit_time_ms,
+			 "Time after changes before sending out COMMIT");
+	opt_register_arg("--fee-base", opt_set_u32, opt_show_u32,
+			 &ld->config.fee_base,
+			 "Millisatoshi minimum to charge for HTLC");
+	opt_register_arg("--rescan", opt_set_s32, opt_show_s32,
+			 &ld->config.rescan,
+			 "Number of blocks to rescan from the current head, or "
+			 "absolute blockheight if negative");
+	opt_register_arg("--fee-per-satoshi", opt_set_u32, opt_show_u32,
+			 &ld->config.fee_per_satoshi,
+			 "Microsatoshi fee for every satoshi in HTLC");
+	opt_register_arg("--max-concurrent-htlcs", opt_set_u32, opt_show_u32,
+			 &ld->config.max_concurrent_htlcs,
+			 "Number of HTLCs one channel can handle concurrently. Should be between 1 and 483");
+	opt_register_arg("--min-capacity-sat", opt_set_u64, opt_show_u64,
+			 &ld->config.min_capacity_sat,
+			 "Minimum capacity in satoshis for accepting channels");
+	opt_register_arg("--addr", opt_add_addr, NULL,
+			 ld,
+			 "Set an IP address (v4 or v6) to listen on and announce to the network for incoming connections");
+	opt_register_arg("--bind-addr", opt_add_bind_addr, NULL,
+			 ld,
+			 "Set an IP address (v4 or v6) to listen on, but not announce");
+	opt_register_arg("--announce-addr", opt_add_announce_addr, NULL,
+			 ld,
+			 "Set an IP address (v4 or v6) or .onion v2/v3 to announce, but not listen on");
+
+	opt_register_noarg("--offline", opt_set_offline, ld,
+			   "Start in offline-mode (do not automatically reconnect and do not accept incoming connections)");
+	opt_register_arg("--autolisten", opt_set_bool_arg, opt_show_bool,
+			 &ld->autolisten,
+			 "If true, listen on default port and announce if it seems to be a public interface");
+
+	opt_register_arg("--proxy", opt_add_proxy_addr, NULL,
+			ld,"Set a socks v5 proxy IP address and port");
+	opt_register_arg("--tor-service-password", opt_set_talstr, NULL,
+			 &ld->tor_service_password,
+			 "Set a Tor hidden service password");
+
+	opt_register_noarg("--disable-dns", opt_set_invbool, &ld->config.use_dns,
+			   "Disable DNS lookups of peers");
+
+	opt_register_noarg("--enable-autotor-v2-mode", opt_set_invbool, &ld->config.use_v3_autotor,
+			   "Try to get a v2 onion address from the Tor service call, default is v3");
+
+	opt_register_noarg("--encrypted-hsm", opt_set_hsm_password, ld,
+	                   "Set the password to encrypt hsm_secret with. If no password is passed through command line, "
+	                   "you will be prompted to enter it.");
+
+	opt_register_arg("--rpc-file-mode", &opt_set_mode, &opt_show_mode,
+			 &ld->rpc_filemode,
+			 "Set the file mode (permissions) for the "
+			 "JSON-RPC socket");
+
+	opt_register_arg("--subdaemon", opt_subdaemon, NULL,
+			 ld, "Arg specified as SUBDAEMON:PATH. "
+			 "Specifies an alternate subdaemon binary. "
+			 "If the supplied path is relative the subdaemon "
+			 "binary is found in the working directory. "
+			 "This option may be specified multiple times. "
+			 "For example, "
+			 "--subdaemon=hsmd:remote_signer "
+			 "would use a hypothetical remote signing subdaemon.");
+
 	opt_register_logging(ld);
 	opt_register_version();
 
-	configdir_register_opts(ld, &ld->config_dir, &ld->rpc_filename);
-	config_register_opts(ld);
 #if DEVELOPER
 	dev_register_opts(ld);
 #endif
+}
+
+/* We are in ld->config_netdir when this is run! */
+static void promote_missing_files(struct lightningd *ld)
+{
+#ifdef COMPAT_V073
+	DIR *d_from;
+	struct dirent *d;
+	struct stat st;
+
+	/* If hsm_secret already exists, we assume we're ugpraded */
+	if (stat("hsm_secret", &st) == 0)
+		return;
+
+	if (errno != ENOENT)
+		err(1, "Looking for hsm_secret in lightning dir");
+
+	/* If hsm doesn't exist in basedir, we've nothing to upgrade. */
+	if (stat(path_join(tmpctx, ld->config_basedir, "hsm_secret"), &st) != 0)
+		return;
+
+	d_from = opendir(ld->config_basedir);
+	if (!d_from)
+		err(1, "Opening %s", ld->config_basedir);
+
+	while ((d = readdir(d_from)) != NULL) {
+		const char *fullname;
+
+		/* Ignore this directory and upper one, and leave
+		 * config and pid files */
+		if (streq(d->d_name, ".")
+		    || streq(d->d_name, "..")
+		    || streq(d->d_name, "config")
+		    || strends(d->d_name, ".pid"))
+			continue;
+
+		fullname = path_join(tmpctx, ld->config_basedir, d->d_name);
+
+		/* Simply remove rpc file: if they use --rpc-file to place it
+		 * here explicitly it will get recreated, but moving it would
+		 * be confusing as it would be unused. */
+		if (streq(d->d_name, "lightning-rpc")) {
+			if (unlink(fullname) != 0)
+				log_unusual(ld->log, "Could not unlink %s: %s",
+					    fullname, strerror(errno));
+			continue;
+		}
+
+		/* Ignore any directories. */
+		if (lstat(fullname, &st) != 0)
+			errx(1, "Could not stat %s", fullname);
+		if ((st.st_mode & S_IFMT) == S_IFDIR)
+			continue;
+
+		/* Check we don't overwrite something in this dir! */
+		if (lstat(d->d_name, &st) != -1)
+			errx(1, "Refusing to overwrite %s into %s/",
+			     fullname, ld->config_netdir);
+		log_unusual(ld->log, "Moving %s into %s/",
+			    d->d_name, ld->config_netdir);
+		if (rename(fullname, d->d_name) != 0)
+			err(1, "Could not move %s/%s to %s",
+			    ld->config_basedir, d->d_name, ld->config_netdir);
+	}
+	closedir(d_from);
+#endif /* COMPAT_V073 */
 }
 
 /* Names stolen from https://github.com/ternus/nsaproductgenerator/blob/master/nsa.js */
@@ -820,19 +979,16 @@ static const char *codename_noun[]
 
 void setup_color_and_alias(struct lightningd *ld)
 {
-	u8 der[PUBKEY_DER_LEN];
-	pubkey_to_der(der, &ld->id);
-
 	if (!ld->rgb)
 		/* You can't get much red by default */
-		ld->rgb = tal_dup_arr(ld, u8, der, 3, 0);
+		ld->rgb = tal_dup_arr(ld, u8, ld->id.k, 3, 0);
 
 	if (!ld->alias) {
 		u64 adjective, noun;
 		char *name;
 
-		memcpy(&adjective, der+3, sizeof(adjective));
-		memcpy(&noun, der+3+sizeof(adjective), sizeof(noun));
+		memcpy(&adjective, ld->id.k+3, sizeof(adjective));
+		memcpy(&noun, ld->id.k+3+sizeof(adjective), sizeof(noun));
 		noun %= ARRAY_SIZE(codename_noun);
 		adjective %= ARRAY_SIZE(codename_adjective);
 
@@ -858,16 +1014,70 @@ void setup_color_and_alias(struct lightningd *ld)
 
 void handle_early_opts(struct lightningd *ld, int argc, char *argv[])
 {
-	/* Load defaults. The actual values loaded here will be overwritten
-	 * later by opt_parse_from_config. */
-	setup_default_config(ld);
+	/* Make ccan/opt use tal for allocations */
+	setup_option_allocators();
 
-	/* Get any configdir/testnet options first. */
+	/*~ List features immediately, before doing anything interesting */
+	opt_register_early_noarg("--list-features-only",
+				 list_features_and_exit,
+				 ld, opt_hidden);
+
+	/*~ This does enough parsing to get us the base configuration options */
+	initial_config_opts(ld, argc, argv,
+			    &ld->config_filename,
+			    &ld->config_basedir,
+			    &ld->config_netdir,
+			    &ld->rpc_filename);
+
+	/* Copy in default config, to be modified by further options */
+	if (chainparams->testnet)
+		ld->config = testnet_config;
+	else
+		ld->config = mainnet_config;
+
+	/* Now we can initialize wallet_dsn */
+	ld->wallet_dsn = tal_fmt(ld, "sqlite3://%s/lightningd.sqlite3",
+				 ld->config_netdir);
+
+	/* Set default PID file name to be per-network (in base dir) */
+	ld->pidfile = path_join(ld, ld->config_basedir,
+				tal_fmt(tmpctx, "lightningd-%s.pid",
+					chainparams->network_name));
+
+	/*~ Move into config dir: this eases path manipulation and also
+	 * gives plugins a good place to store their stuff. */
+	if (chdir(ld->config_netdir) != 0) {
+		log_unusual(ld->log, "Creating configuration directory %s",
+			    ld->config_netdir);
+		/* We assume home dir exists, so only create two. */
+		if (mkdir(ld->config_basedir, 0700) != 0 && errno != EEXIST)
+			fatal("Could not make directory %s: %s",
+			      ld->config_basedir,
+			      strerror(errno));
+		if (mkdir(ld->config_netdir, 0700) != 0)
+			fatal("Could not make directory %s: %s",
+			      ld->config_netdir, strerror(errno));
+		if (chdir(ld->config_netdir) != 0)
+			fatal("Could not change directory %s: %s",
+			      ld->config_netdir, strerror(errno));
+	}
+
+	/*~ We move files from old locations on first upgrade. */
+	promote_missing_files(ld);
+
+	/*~ The ccan/opt code requires registration then parsing; we
+	 *  mimic this API here, even though they're on separate lines.*/
+	register_opts(ld);
+
+	/* Now look inside config file(s), but only handle the early
+	 * options (testnet, plugins etc), others may be added on-demand */
+	parse_config_files(ld->config_filename, ld->config_basedir, true);
+
+	/* Early cmdline options now override config file options. */
 	opt_early_parse_incomplete(argc, argv, opt_log_stderr_exit);
 
-	/* Now look for config file, but only handle the early
-	 * options, others may be added on-demand */
-	opt_parse_from_config(ld, true);
+	/* Finalize the logging subsystem now. */
+	logging_options_parsed(ld->log_book);
 }
 
 void handle_opts(struct lightningd *ld, int argc, char *argv[])
@@ -875,20 +1085,9 @@ void handle_opts(struct lightningd *ld, int argc, char *argv[])
 	/* Now look for config file, but only handle non-early
 	 * options, early ones have been parsed in
 	 * handle_early_opts */
-	opt_parse_from_config(ld, false);
+	parse_config_files(ld->config_filename, ld->config_basedir, false);
 
-	/* Move to config dir, to save ourselves the hassle of path manip. */
-	if (chdir(ld->config_dir) != 0) {
-		log_unusual(ld->log, "Creating configuration directory %s",
-			    ld->config_dir);
-		if (mkdir(ld->config_dir, 0700) != 0)
-			fatal("Could not make directory %s: %s",
-			      ld->config_dir, strerror(errno));
-		if (chdir(ld->config_dir) != 0)
-			fatal("Could not change directory %s: %s",
-			      ld->config_dir, strerror(errno));
-	}
-
+	/* Now parse cmdline, which overrides config. */
 	opt_parse(&argc, argv, opt_log_stderr_exit);
 	if (argc != 1)
 		errx(1, "no arguments accepted");
@@ -936,20 +1135,46 @@ static void json_add_opt_addrs(struct json_stream *response,
 	}
 }
 
+struct json_add_opt_alt_subdaemon_args {
+	const char *name0;
+	struct json_stream *response;
+};
+
+static bool json_add_opt_alt_subdaemon(const char *member,
+				       const char *value,
+				       struct json_add_opt_alt_subdaemon_args *argp)
+{
+	json_add_string(argp->response,
+			argp->name0,
+			tal_fmt(argp->name0, "%s:%s", member, value));
+	return true;
+}
+
+static void json_add_opt_subdaemons(struct json_stream *response,
+				    const char *name0,
+				    alt_subdaemon_map *alt_subdaemons)
+{
+	struct json_add_opt_alt_subdaemon_args args;
+	args.name0 = name0;
+	args.response = response;
+	strmap_iterate(alt_subdaemons, json_add_opt_alt_subdaemon, &args);
+}
+
 static void add_config(struct lightningd *ld,
 		       struct json_stream *response,
 		       const struct opt_table *opt,
 		       const char *name, size_t len)
 {
-	char *name0 = tal_strndup(response, name, len);
+	char *name0 = tal_strndup(tmpctx, name, len);
 	const char *answer = NULL;
+	char buf[OPT_SHOW_LEN + sizeof("...")];
 
 	if (opt->type & OPT_NOARG) {
-		if (opt->cb == (void *)opt_usage_and_exit
+		if (opt->desc == opt_hidden) {
+			/* Ignore hidden options (deprecated) */
+		} else if (opt->cb == (void *)opt_usage_and_exit
 		    || opt->cb == (void *)version_and_exit
-		    /* These two show up as --network= */
-		    || opt->cb == (void *)opt_set_testnet
-		    || opt->cb == (void *)opt_set_mainnet
+		    || is_restricted_ignored(opt->cb)
 		    || opt->cb == (void *)opt_lightningd_usage
 		    || opt->cb == (void *)test_subdaemons_and_exit
 		    /* FIXME: we can't recover this. */
@@ -965,6 +1190,20 @@ static void add_config(struct lightningd *ld,
 			answer = tal_fmt(name0, "%s",
 					 (!ld->reconnect && !ld->listen)
 					 ? "true" : "false");
+		} else if (opt->cb == (void *)opt_start_daemon) {
+			answer = tal_fmt(name0, "%s",
+					 ld->daemon_parent_fd == -1
+					 ? "false" : "true");
+		} else if (opt->cb == (void *)opt_set_hsm_password) {
+			json_add_bool(response, "encrypted-hsm", ld->encrypted_hsm);
+		} else if (opt->cb == (void *)opt_set_wumbo) {
+			json_add_bool(response, "wumbo",
+				      feature_offered(ld->our_features
+						      ->bits[INIT_FEATURE],
+						      OPT_LARGE_CHANNELS));
+		} else if (opt->cb == (void *)plugin_opt_flag_set) {
+			/* Noop, they will get added below along with the
+			 * OPT_HASARG options. */
 		} else {
 			/* Insert more decodes here! */
 			assert(!"A noarg option was added but was not handled");
@@ -973,7 +1212,7 @@ static void add_config(struct lightningd *ld,
 		if (opt->desc == opt_hidden) {
 			/* Ignore hidden options (deprecated) */
 		} else if (opt->show) {
-			char *buf = tal_arr(name0, char, OPT_SHOW_LEN+1);
+			strcpy(buf + OPT_SHOW_LEN, "...");
 			opt->show(buf, opt->u.carg);
 
 			if (streq(buf, "true") || streq(buf, "false")
@@ -987,12 +1226,14 @@ static void add_config(struct lightningd *ld,
 
 			/* opt_show_charp surrounds with "", strip them */
 			if (strstarts(buf, "\"")) {
-				buf[strlen(buf)-1] = '\0';
+				char *end = strrchr(buf, '"');
+				memmove(end, end + 1, strlen(end));
 				answer = buf + 1;
 			} else
 				answer = buf;
 		} else if (opt->cb_arg == (void *)opt_set_talstr
-			   || opt->cb_arg == (void *)opt_set_charp) {
+			   || opt->cb_arg == (void *)opt_set_charp
+			   || is_restricted_print_if_nonnull(opt->cb_arg)) {
 			const char *arg = *(char **)opt->u.carg;
 			if (arg)
 				answer = tal_fmt(name0, "%s", arg);
@@ -1021,14 +1262,22 @@ static void add_config(struct lightningd *ld,
 					   ld->proposed_listen_announce,
 					   ADDR_ANNOUNCE);
 			return;
+		} else if (opt->cb_arg == (void *)opt_subdaemon) {
+			json_add_opt_subdaemons(response, name0,
+						    &ld->alt_subdaemons);
+			return;
 		} else if (opt->cb_arg == (void *)opt_add_proxy_addr) {
 			if (ld->proxyaddr)
 				answer = fmt_wireaddr(name0, ld->proxyaddr);
 		} else if (opt->cb_arg == (void *)opt_add_plugin) {
 			json_add_opt_plugins(response, ld->plugins);
+		} else if (opt->cb_arg == (void *)opt_log_level) {
+			json_add_opt_log_levels(response, ld->log);
+		} else if (opt->cb_arg == (void *)opt_disable_plugin) {
+			json_add_opt_disable_plugins(response, ld->plugins);
 		} else if (opt->cb_arg == (void *)opt_add_plugin_dir
-			   || opt->cb_arg == (void *)opt_disable_plugin
-			   || opt->cb_arg == (void *)plugin_opt_set) {
+			   || opt->cb_arg == (void *)plugin_opt_set
+			   || opt->cb_arg == (void *)plugin_opt_flag_set) {
 			/* FIXME: We actually treat it as if they specified
 			 * --plugin for each one, so ignore these */
 #if DEVELOPER
@@ -1042,10 +1291,9 @@ static void add_config(struct lightningd *ld,
 	}
 
 	if (answer) {
-		struct json_escaped *esc = json_escape(NULL, answer);
+		struct json_escape *esc = json_escape(NULL, answer);
 		json_add_escaped_string(response, name0, take(esc));
 	}
-	tal_free(name0);
 }
 
 static struct command_result *json_listconfigs(struct command *cmd,
@@ -1064,7 +1312,6 @@ static struct command_result *json_listconfigs(struct command *cmd,
 
 	if (!configtok) {
 		response = json_stream_success(cmd);
-		json_object_start(response, NULL);
 		json_add_string(response, "# version", version());
 	}
 
@@ -1089,10 +1336,8 @@ static struct command_result *json_listconfigs(struct command *cmd,
 				      name + 1, len - 1))
 				continue;
 
-			if (!response) {
+			if (!response)
 				response = json_stream_success(cmd);
-				json_object_start(response, NULL);
-			}
 			add_config(cmd->ld, response, &opt_table[i],
 				   name+1, len-1);
 		}
@@ -1104,15 +1349,14 @@ static struct command_result *json_listconfigs(struct command *cmd,
 				    json_tok_full_len(configtok),
 				    json_tok_full(buffer, configtok));
 	}
-	json_object_end(response);
 	return command_success(cmd, response);
 }
 
 static const struct json_command listconfigs_command = {
 	"listconfigs",
+	"utility",
 	json_listconfigs,
 	"List all configuration options, or with [config], just that one.",
-
 	.verbose = "listconfigs [config]\n"
 	"Outputs an object, with each field a config options\n"
 	"(Option names which start with # are comments)\n"

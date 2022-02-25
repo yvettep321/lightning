@@ -1,27 +1,23 @@
 /* Only possible if we're in developer mode. */
-#include "memdump.h"
+#include "config.h"
 #if DEVELOPER
 #include <backtrace.h>
-#include <ccan/strmap/strmap.h>
 #include <ccan/tal/str/str.h>
-#include <common/daemon.h>
 #include <common/json_command.h>
-#include <common/jsonrpc_errors.h>
 #include <common/memleak.h>
 #include <common/param.h>
 #include <common/timeout.h>
-#include <connectd/gen_connect_wire.h>
+#include <connectd/connectd_wiregen.h>
 #include <errno.h>
-#include <gossipd/gen_gossip_wire.h>
-#include <hsmd/gen_hsm_wire.h>
+#include <gossipd/gossipd_wiregen.h>
+#include <hsmd/hsmd_wiregen.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
-#include <lightningd/log.h>
-#include <lightningd/opening_control.h>
+#include <lightningd/memdump.h>
+#include <lightningd/opening_common.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/subd.h>
-#include <stdio.h>
 #include <wire/wire_sync.h>
 
 static void json_add_ptr(struct json_stream *response, const char *name,
@@ -32,15 +28,17 @@ static void json_add_ptr(struct json_stream *response, const char *name,
 	json_add_string(response, name, ptrstr);
 }
 
-static void add_memdump(struct json_stream *response,
+static size_t add_memdump(struct json_stream *response,
 			const char *name, const tal_t *root,
 			struct command *cmd)
 {
 	const tal_t *i;
+	size_t cumulative_size = 0;
 
 	json_array_start(response, name);
 	for (i = tal_first(root); i; i = tal_next(i)) {
 		const char *name = tal_name(i);
+		size_t size = tal_bytelen(i);
 
 		/* Don't try to dump this command! */
 		if (i == cmd || i == cmd->jcon)
@@ -53,14 +51,18 @@ static void add_memdump(struct json_stream *response,
 		json_object_start(response, NULL);
 		json_add_ptr(response, "parent", tal_parent(i));
 		json_add_ptr(response, "value", i);
+		json_add_u64(response, "size", size);
 		if (name)
 			json_add_string(response, "label", name);
 
 		if (tal_first(i))
-			add_memdump(response, "children", i, cmd);
+			size += add_memdump(response, "children", i, cmd);
+		json_add_u64(response, "cumulative_size", size);
 		json_object_end(response);
+		cumulative_size += size;
 	}
 	json_array_end(response);
+	return cumulative_size;
 }
 
 static struct command_result *json_memdump(struct command *cmd,
@@ -74,13 +76,14 @@ static struct command_result *json_memdump(struct command *cmd,
 		return command_param_failed();
 
 	response = json_stream_success(cmd);
-	add_memdump(response, NULL, NULL, cmd);
+	add_memdump(response, "memdump", NULL, cmd);
 
 	return command_success(cmd, response);
 }
 
 static const struct json_command dev_memdump_command = {
 	"dev-memdump",
+	"developer",
 	json_memdump,
 	"Show memory objects currently in use"
 };
@@ -121,22 +124,6 @@ static void json_add_backtrace(struct json_stream *response,
 	json_array_end(response);
 }
 
-static bool handle_strmap(const char *member, void *p, void *memtable_)
-{
-	struct htable *memtable = memtable_;
-
-	memleak_scan_region(memtable, p, tal_bytelen(p));
-
-	/* Keep going */
-	return true;
-}
-
-/* FIXME: If strmap used tal, this wouldn't be necessary! */
-void memleak_remove_strmap_(struct htable *memtable, const struct strmap *m)
-{
-	strmap_iterate_(m, handle_strmap, memtable);
-}
-
 static void scan_mem(struct command *cmd,
 		     struct json_stream *response,
 		     struct lightningd *ld,
@@ -147,17 +134,17 @@ static void scan_mem(struct command *cmd,
 	const uintptr_t *backtrace;
 
 	/* Enter everything, except this cmd and its jcon */
-	memtable = memleak_enter_allocations(cmd, cmd, cmd->jcon);
+	memtable = memleak_find_allocations(cmd, cmd, cmd->jcon);
 
 	/* First delete known false positives. */
 	memleak_remove_htable(memtable, &ld->topology->txwatches.raw);
 	memleak_remove_htable(memtable, &ld->topology->txowatches.raw);
 	memleak_remove_htable(memtable, &ld->htlcs_in.raw);
 	memleak_remove_htable(memtable, &ld->htlcs_out.raw);
-	jsonrpc_remove_memleak(memtable, ld->jsonrpc);
+	memleak_remove_htable(memtable, &ld->htlc_sets.raw);
 
 	/* Now delete ld and those which it has pointers to. */
-	memleak_remove_referenced(memtable, ld);
+	memleak_remove_region(memtable, ld, sizeof(*ld));
 
 	json_array_start(response, "leaks");
 	while ((i = memleak_get(memtable, &backtrace)) != NULL) {
@@ -195,9 +182,7 @@ static void report_leak_info2(struct leak_info *leak_info)
 {
 	struct json_stream *response = json_stream_success(leak_info->cmd);
 
-	json_object_start(response, NULL);
 	scan_mem(leak_info->cmd, response, leak_info->cmd->ld, leak_info->leaker);
-	json_object_end(response);
 
 	was_pending(command_success(leak_info->cmd, response));
 }
@@ -210,7 +195,7 @@ static void report_leak_info(struct command *cmd, struct subd *leaker)
 	leak_info->leaker = leaker;
 
 	/* Leak detection in a reply handler thinks we're leaking conn. */
-	notleak(new_reltimer(&leak_info->cmd->ld->timers, leak_info->cmd,
+	notleak(new_reltimer(leak_info->cmd->ld->timers, leak_info->cmd,
 			     time_from_sec(0),
 			     report_leak_info2, leak_info));
 }
@@ -222,7 +207,7 @@ static void gossip_dev_memleak_done(struct subd *gossipd,
 {
 	bool found_leak;
 
-	if (!fromwire_gossip_dev_memleak_reply(reply, &found_leak)) {
+	if (!fromwire_gossipd_dev_memleak_reply(reply, &found_leak)) {
 		was_pending(command_fail(cmd, LIGHTNINGD,
 					 "Bad gossip_dev_memleak"));
 		return;
@@ -238,7 +223,7 @@ static void connect_dev_memleak_done(struct subd *connectd,
 {
 	bool found_leak;
 
-	if (!fromwire_connect_dev_memleak_reply(reply, &found_leak)) {
+	if (!fromwire_connectd_dev_memleak_reply(reply, &found_leak)) {
 		was_pending(command_fail(cmd, LIGHTNINGD,
 					 "Bad connect_dev_memleak"));
 		return;
@@ -260,7 +245,7 @@ static void hsm_dev_memleak_done(struct subd *hsmd,
 	struct lightningd *ld = cmd->ld;
 	bool found_leak;
 
-	if (!fromwire_hsm_dev_memleak_reply(reply, &found_leak)) {
+	if (!fromwire_hsmd_dev_memleak_reply(reply, &found_leak)) {
 		was_pending(command_fail(cmd, LIGHTNINGD,
 					 "Bad hsm_dev_memleak"));
 		return;
@@ -272,7 +257,7 @@ static void hsm_dev_memleak_done(struct subd *hsmd,
 	}
 
 	/* No leak?  Ask gossipd. */
-	subd_req(ld->gossip, ld->gossip, take(towire_gossip_dev_memleak(NULL)),
+	subd_req(ld->gossip, ld->gossip, take(towire_gossipd_dev_memleak(NULL)),
 		 -1, 0, gossip_dev_memleak_done, cmd);
 }
 
@@ -282,7 +267,7 @@ void peer_memleak_done(struct command *cmd, struct subd *leaker)
 		report_leak_info(cmd, leaker);
 	else {
 		/* No leak there, try hsmd (we talk to hsm sync) */
-		u8 *msg = towire_hsm_dev_memleak(NULL);
+		u8 *msg = towire_hsmd_dev_memleak(NULL);
 		if (!wire_sync_write(cmd->ld->hsm_fd, take(msg)))
 			fatal("Could not write to HSM: %s", strerror(errno));
 
@@ -319,7 +304,7 @@ static struct command_result *json_memleak(struct command *cmd,
 
 	/* Start by asking connectd, which is always async. */
 	subd_req(ld->connectd, ld->connectd,
-		 take(towire_connect_dev_memleak(NULL)),
+		 take(towire_connectd_dev_memleak(NULL)),
 		 -1, 0, connect_dev_memleak_done, cmd);
 
 	return command_still_pending(cmd);
@@ -327,6 +312,7 @@ static struct command_result *json_memleak(struct command *cmd,
 
 static const struct json_command dev_memleak_command = {
 	"dev-memleak",
+	"developer",
 	json_memleak,
 	"Show unreferenced memory objects"
 };
