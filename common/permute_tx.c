@@ -1,83 +1,15 @@
-#include "permute_tx.h"
-#include <stdbool.h>
-#include <string.h>
+#include "config.h"
+#include <common/permute_tx.h>
+#include <wally_psbt.h>
 
-static bool input_better(const struct bitcoin_tx_input *a,
-			 const struct bitcoin_tx_input *b)
+static void swap_wally_outputs(struct wally_tx_output *outputs,
+			       struct wally_tx_output *psbt_global_outs,
+			       struct wally_psbt_output *psbt_outs,
+			       const void **map, u32 *cltvs,
+			       size_t i1, size_t i2)
 {
-	int cmp;
-
-	cmp = memcmp(&a->txid, &b->txid, sizeof(a->txid));
-	if (cmp != 0)
-		return cmp < 0;
-	if (a->index != b->index)
-		return a->index < b->index;
-
-	/* These shouldn't happen, but let's get a canonical order anyway. */
-	if (tal_count(a->script) != tal_count(b->script))
-		return tal_count(a->script) < tal_count(b->script);
-	cmp = memcmp(a->script, b->script, tal_count(a->script));
-	if (cmp != 0)
-		return cmp < 0;
-	return a->sequence_number < b->sequence_number;
-}
-
-static size_t find_best_in(struct bitcoin_tx_input *inputs, size_t num)
-{
-	size_t i, best = 0;
-
-	for (i = 1; i < num; i++) {
-		if (input_better(&inputs[i], &inputs[best]))
-			best = i;
-	}
-	return best;
-}
-
-static void swap_inputs(struct bitcoin_tx_input *inputs,
-			const void **map,
-			size_t i1, size_t i2)
-{
-	struct bitcoin_tx_input tmpinput;
-	const void *tmp;
-
-	if (i1 == i2)
-		return;
-
-	tmpinput = inputs[i1];
-	inputs[i1] = inputs[i2];
-	inputs[i2] = tmpinput;
-
-	if (map) {
-		tmp = map[i1];
-		map[i1] = map[i2];
-		map[i2] = tmp;
-	}
-}
-
-void permute_inputs(struct bitcoin_tx_input *inputs,
-		    const void **map)
-{
-	size_t i;
-	size_t num_inputs = tal_count(inputs);
-
-	/* We can't permute nothing! */
-	if (num_inputs == 0)
-		return;
-
-	/* Now do a dumb sort (num_inputs is small). */
-	for (i = 0; i < num_inputs-1; i++) {
-		/* Swap best into first place. */
-		swap_inputs(inputs, map,
-			    i, i + find_best_in(inputs + i, num_inputs - i));
-	}
-}
-
-static void swap_outputs(struct bitcoin_tx_output *outputs,
-			 const void **map,
-			 u32 *cltvs,
-			 size_t i1, size_t i2)
-{
-	struct bitcoin_tx_output tmpoutput;
+	struct wally_tx_output tmpoutput;
+	struct wally_psbt_output tmppsbtout;
 
 	if (i1 == i2)
 		return;
@@ -85,6 +17,16 @@ static void swap_outputs(struct bitcoin_tx_output *outputs,
 	tmpoutput = outputs[i1];
 	outputs[i1] = outputs[i2];
 	outputs[i2] = tmpoutput;
+
+	/* For the PSBT, we swap the psbt outputs and
+	 * the global tx's outputs */
+	tmpoutput = psbt_global_outs[i1];
+	psbt_global_outs[i1] = psbt_global_outs[i2];
+	psbt_global_outs[i2] = tmpoutput;
+
+	tmppsbtout = psbt_outs[i1];
+	psbt_outs[i1] = psbt_outs[i2];
+	psbt_outs[i2] = tmppsbtout;
 
 	if (map) {
 		const void *tmp = map[i1];
@@ -99,20 +41,18 @@ static void swap_outputs(struct bitcoin_tx_output *outputs,
 	}
 }
 
-static bool output_better(const struct bitcoin_tx_output *a,
-			  u32 cltv_a,
-			  const struct bitcoin_tx_output *b,
-			  u32 cltv_b)
+static bool output_better(const struct wally_tx_output *a, u32 cltv_a,
+			  const struct wally_tx_output *b, u32 cltv_b)
 {
 	size_t len, lena, lenb;
 	int ret;
 
-	if (a->amount != b->amount)
-		return a->amount < b->amount;
+	if (a->satoshi != b->satoshi)
+		return a->satoshi < b->satoshi;
 
 	/* Lexicographical sort. */
-	lena = tal_count(a->script);
-	lenb = tal_count(b->script);
+	lena = a->script_len;
+	lenb = b->script_len;
 	if (lena < lenb)
 		len = lena;
 	else
@@ -135,8 +75,7 @@ static u32 cltv_of(const u32 *cltvs, size_t idx)
 	return cltvs[idx];
 }
 
-static size_t find_best_out(struct bitcoin_tx_output *outputs,
-			    const u32 *cltvs,
+static size_t find_best_out(struct wally_tx_output *outputs, const u32 *cltvs,
 			    size_t num)
 {
 	size_t i, best = 0;
@@ -149,23 +88,26 @@ static size_t find_best_out(struct bitcoin_tx_output *outputs,
 	return best;
 }
 
-void permute_outputs(struct bitcoin_tx_output *outputs,
-		     u32 *cltvs,
-		     const void **map)
+void permute_outputs(struct bitcoin_tx *tx, u32 *cltvs, const void **map)
 {
-	size_t i;
-	size_t num_outputs = tal_count(outputs);
+	size_t i, best_pos;
+	struct wally_tx_output *outputs = tx->wtx->outputs;
+	size_t num_outputs = tx->wtx->num_outputs;
 
 	/* We can't permute nothing! */
 	if (num_outputs == 0)
 		return;
 
 	/* Now do a dumb sort (num_outputs is small). */
-	for (i = 0; i < num_outputs-1; i++) {
+	for (i = 0; i < num_outputs - 1; i++) {
+		best_pos =
+		    i + find_best_out(outputs + i, cltvs ? cltvs + i : NULL,
+				      num_outputs - i);
+
 		/* Swap best into first place. */
-		swap_outputs(outputs, map, cltvs,
-			     i, i + find_best_out(outputs + i,
-						  cltvs ? cltvs + i : NULL,
-						  num_outputs - i));
+		swap_wally_outputs(tx->wtx->outputs,
+				   tx->psbt->tx->outputs,
+				   tx->psbt->outputs,
+				   map, cltvs, i, best_pos);
 	}
 }

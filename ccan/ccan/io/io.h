@@ -390,6 +390,40 @@ struct io_plan *io_out_always_(struct io_conn *conn,
 			       void *arg);
 
 /**
+ * io_sock_shutdown - start socket close process (flushes TCP sockets).
+ * @conn: the connection the plan is for
+ *
+ * Simply closing a TCP socket can lose data; unfortunately you should
+ * shutdown(SHUT_WR) and wait for the other side to see this and close.
+ * Of course, you also need to set a timer, in case it doesn't (you may
+ * already have some responsiveness timer, of course).
+ *
+ * On error, is equivalent to io_close().
+ *
+ * Example:
+ * #include <ccan/timer/timer.h>
+ *
+ * // Timer infra needs wrapper to contain extra data.
+ * struct timeout_timer {
+ *    struct timer t;
+ *    struct io_conn *conn;
+ * };
+ * static struct timers timers;
+ *
+ * static struct io_plan *flush_and_close(struct io_conn *conn)
+ * {
+ *    struct timeout_timer *timeout;
+ *    // Freed if conn closes normally.
+ *    timeout = tal(conn, struct timeout_timer);
+ *    timeout->conn = conn;
+ *    timeout->t = conn;
+ *    timer_addrel(&timers, &timeout->t, time_from_sec(5));
+ *    return io_sock_shutdown(conn);
+ * }
+ */
+struct io_plan *io_sock_shutdown(struct io_conn *conn);
+
+/**
  * io_connect - create an asynchronous connection to a listening socket.
  * @conn: the connection that plan is for.
  * @addr: where to connect.
@@ -721,6 +755,35 @@ bool io_plan_out_started(const struct io_conn *conn);
  *	io_close_taken_fd
  */
 bool io_flush_sync(struct io_conn *conn);
+
+/**
+ * io_conn_exclusive - set/unset an io_conn to exclusively serviced
+ * @conn: the connection
+ * @exclusive: whether to be exclusive or not
+ *
+ * If any io_conn is set exclusive, then no non-exclusive io_conn (or
+ * io_listener) will be serviced by io_loop().  If it's a io_duplex io_conn(),
+ * then io_conn_exclusive() makes the read-side exclusive; io_conn_out_exclusive()
+ * makes the write-side exclusive.
+ *
+ * This allows you to temporarily service only one (or several) fds.
+ * For example, you might want to flush out one io_conn and not
+ * receive any new connections or read any other input.
+ *
+ * Returns true if any exclusive io_conn remain, otherwise false.
+ * (This is useful for checking your own logic: dangling exclusive io_conn
+ * are dangerous!).
+ */
+bool io_conn_exclusive(struct io_conn *conn, bool exclusive);
+
+/**
+ * io_conn_out_exclusive - set/unset exclusive on the write-side of a duplex
+ * @conn: the connection, post io_duplex
+ * @exclusive: whether to be exclusive or not
+ *
+ * See io_conn_exclusive() above.
+ */
+bool io_conn_out_exclusive(struct io_conn *conn, bool exclusive);
 
 /**
  * io_fd_block - helper to set an fd blocking/nonblocking.

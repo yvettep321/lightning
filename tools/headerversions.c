@@ -1,5 +1,6 @@
 /* Updates the given file if any library versions have changed.  This
  * is important for systemwide updates, such as sqlite3. */
+#include "config.h"
 #include <ccan/err/err.h>
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/tal/grab_file/grab_file.h>
@@ -7,28 +8,38 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <gmp.h>
-#include <sqlite3.h>
-#include <sys/stat.h>
-#include <sys/types.h>
+#if HAVE_SQLITE3
+# include <sqlite3.h>
+# define IF_SQLITE3(...) __VA_ARGS__
+#else
+# define IF_SQLITE3(...)
+#endif
 #include <unistd.h>
 #include <zlib.h>
 
 static const char template[] =
 	"/* Generated file by tools/headerversions, do not edit! */\n"
 	"/* GMP version: %s */\n"
-	"/* SQLITE3 version: %u */\n"
+	IF_SQLITE3("/* SQLITE3 version: %u */\n")
 	"/* ZLIB version: %s */\n"
 	"#include <ccan/err/err.h>\n"
 	"#include <gmp.h>\n"
-	"#include <sqlite3.h>\n"
+	IF_SQLITE3("#include <sqlite3.h>\n")
 	"#include <zlib.h>\n"
 	"\n"
 	"static inline void check_linked_library_versions(void)\n"
 	"{\n"
 	"	char compiled_gmp_version[100];\n"
-	"	if (SQLITE_VERSION_NUMBER != sqlite3_libversion_number())\n"
+	IF_SQLITE3(
+	"       /* Require at least the version we compiled with. */"
+	"	if (SQLITE_VERSION_NUMBER > sqlite3_libversion_number())\n"
 	"		errx(1, \"SQLITE version mismatch: compiled %%u, now %%u\",\n"
 	"		     SQLITE_VERSION_NUMBER, sqlite3_libversion_number());\n"
+	"       /* Ensure the major version matches. */"
+	"	if (SQLITE_VERSION_NUMBER + 1000000 < sqlite3_libversion_number())\n"
+	"		errx(1, \"SQLITE major version mismatch: compiled %%u, now %%u\",\n"
+	"		     SQLITE_VERSION_NUMBER, sqlite3_libversion_number());\n"
+	)
 	"	/* zlib documents that first char alters ABI. Kudos! */\n"
 	"	if (zlibVersion()[0] != ZLIB_VERSION[0])\n"
 	"		errx(1, \"zlib version mismatch: compiled %%s, now %%s\",\n"
@@ -60,7 +71,7 @@ int main(int argc, char *argv[])
 
 	new = tal_fmt(NULL, template,
 		      gmp_version,
-		      sqlite3_libversion_number(),
+		      IF_SQLITE3(sqlite3_libversion_number(),)
 		      zlibVersion());
 	if (!file || !streq(new, file)) {
 		int fd = open(argv[1], O_TRUNC|O_WRONLY|O_CREAT, 0666);

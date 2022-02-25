@@ -17,17 +17,13 @@
 
 /*~ Notice how includes are in ASCII order: this is actually enforced by
  * the build system under `make check-source`.  It avoids merge conflicts
- * and keeps things consistent. */
-#include "gossip_control.h"
-#include "hsm_control.h"
-#include "lightningd.h"
-#include "peer_control.h"
-#include "subd.h"
+ * and keeps things consistent.  It also make sure you include "config.h"
+ * before anything else. */
+#include "config.h"
 
 /*~ This is Ian Lance Taylor's libbacktrace.  It turns out that it's
  * horrifically difficult to obtain a decent backtrace in C; the standard
  * backtrace function is useless in most programs. */
-#include <backtrace.h>
 
 /*~ These headers are from CCAN: http://ccodearchive.net.
  *
@@ -40,16 +36,10 @@
  * in detail below.
  */
 #include <ccan/array_size/array_size.h>
-#include <ccan/cast/cast.h>
-#include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
-#include <ccan/daemonize/daemonize.h>
-#include <ccan/err/err.h>
-#include <ccan/io/fdpass/fdpass.h>
-#include <ccan/io/io.h>
-#include <ccan/noerr/noerr.h>
+#include <ccan/closefrom/closefrom.h>
+#include <ccan/opt/opt.h>
 #include <ccan/pipecmd/pipecmd.h>
 #include <ccan/read_write_all/read_write_all.h>
-#include <ccan/take/take.h>
 #include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
@@ -57,27 +47,39 @@
 /*~ This is common code: routines shared by one or more executables
  *  (separate daemons, or the lightning-cli program). */
 #include <common/daemon.h>
-#include <common/json_escaped.h>
+#include <common/ecdh_hsmd.h>
+#include <common/hsm_encryption.h>
+#include <common/memleak.h>
 #include <common/timeout.h>
-#include <common/utils.h>
+#include <common/type_to_string.h>
 #include <common/version.h>
 
 #include <errno.h>
 #include <fcntl.h>
-#include <gen_header_versions.h>
-#include <lightningd/bitcoind.h>
+#include <header_versions_gen.h>
 #include <lightningd/chaintopology.h>
+#include <lightningd/channel.h>
 #include <lightningd/channel_control.h>
+#include <lightningd/coin_mvts.h>
 #include <lightningd/connect_control.h>
-#include <lightningd/invoice.h>
-#include <lightningd/jsonrpc.h>
-#include <lightningd/log.h>
+#include <lightningd/gossip_control.h>
+#include <lightningd/hsm_control.h>
+#include <lightningd/io_loop_with_timers.h>
+#include <lightningd/lightningd.h>
 #include <lightningd/onchain_control.h>
 #include <lightningd/options.h>
-#include <onchaind/onchain_wire.h>
-#include <signal.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include <lightningd/peer_control.h>
+#include <lightningd/plugin.h>
+#include <lightningd/subd.h>
+#include <sys/resource.h>
+#include <wallet/txfilter.h>
+#include <wally_bip32.h>
+
+static void destroy_alt_subdaemons(struct lightningd *ld);
+#if DEVELOPER
+static void memleak_help_alt_subdaemons(struct htable *memtable,
+					struct lightningd *ld);
+#endif /* DEVELOPER */
 
 /*~ The core lightning object: it's passed everywhere, and is basically a
  * global variable.  This new_xxx pattern is something we'll see often:
@@ -93,9 +95,10 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 * the entire subtree rooted at that node to be freed.
 	 *
 	 * It's incredibly useful for grouping object lifetimes, as we'll see.
-	 * For example, a `struct bitcoin_tx` has a pointer to an array of
-	 * `struct bitcoin_tx_input`; they are allocated off the `struct
-	 * bitcoind_tx`, so freeing the `struct bitcoind_tx` frees them all.
+	 * For example, a `struct lightningd` has a pointer to a `log_book`
+	 * which is allocated off the `struct lightningd`, and has its own
+	 * internal members allocated off `log_book`: freeing `struct
+	 * lightningd` frees them all.
 	 *
 	 * In this case, freeing `ctx` will free `ld`:
 	 */
@@ -111,11 +114,26 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 * is a nod to keeping it minimal and explicit: we need this code for
 	 * testing, but its existence means we're not actually testing the
 	 * same exact code users will be running. */
-	ld->dev_debug_subprocess = NULL;
 #if DEVELOPER
+	ld->dev_debug_subprocess = NULL;
+	ld->dev_no_plugin_checksum = false;
 	ld->dev_disconnect_fd = -1;
 	ld->dev_subdaemon_fail = false;
 	ld->dev_allow_localhost = false;
+	ld->dev_gossip_time = 0;
+	ld->dev_fast_gossip = false;
+	ld->dev_fast_gossip_prune = false;
+	ld->dev_force_privkey = NULL;
+	ld->dev_force_bip32_seed = NULL;
+	ld->dev_force_channel_secrets = NULL;
+	ld->dev_force_channel_secrets_shaseed = NULL;
+	ld->dev_force_tmp_channel_id = NULL;
+	ld->dev_no_htlc_timeout = false;
+	ld->dev_no_version_checks = false;
+	ld->dev_max_funding_unconfirmed = 2016;
+	ld->dev_ignore_modern_onion = false;
+	ld->dev_ignore_obsolete_onion = false;
+	ld->dev_disable_commit = -1;
 #endif
 
 	/*~ These are CCAN lists: an embedded double-linked list.  It's not
@@ -124,8 +142,8 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 *
 	 * You declare them as a `struct list_head` (or use the LIST_HEAD()
 	 * macro which doesn't work on dynamically-allocated objects like `ld`
-	 * here).  The item which will go into the list must declared a
-	 * `struct list_node` for each list it can be in.
+	 * here).  The item which will go into the list must be declared
+	 * a `struct list_node` for each list it can be in.
 	 *
 	 * The most common operations are list_head_init(), list_add(),
 	 * list_del() and list_for_each().
@@ -133,9 +151,10 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 * This method of manually declaring the list hooks avoids dynamic
 	 * allocations to put things into a list. */
 	list_head_init(&ld->peers);
+	list_head_init(&ld->subds);
 
 	/*~ These are hash tables of incoming and outgoing HTLCs (contracts),
-	 * defined as `struct htlc_in` and `struct htlc_out`in htlc_end.h.
+	 * defined as `struct htlc_in` and `struct htlc_out` in htlc_end.h.
 	 * The hash tables are declared there using the very ugly
 	 * HTABLE_DEFINE_TYPE macro.  The key is the channel the HTLC is in
 	 * and the 64-bit htlc-id which is unique for that channel and
@@ -149,15 +168,19 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	htlc_in_map_init(&ld->htlcs_in);
 	htlc_out_map_init(&ld->htlcs_out);
 
-	/*~ We have a two-level log-book infrastructure: we define a 20MB log
+	/*~ For multi-part payments, we need to keep some incoming payments
+	 * in limbo until we get all the parts, or we time them out. */
+	htlc_set_map_init(&ld->htlc_sets);
+
+	/*~ We have a multi-entry log-book infrastructure: we define a 10MB log
 	 * book to hold all the entries (and trims as necessary), and multiple
 	 * log objects which each can write into it, each with a unique
 	 * prefix. */
-	ld->log_book = new_log_book(20*1024*1024, LOG_INFORM);
+	ld->log_book = new_log_book(ld, 10*1024*1024);
 	/*~ Note the tal context arg (by convention, the first argument to any
 	 * allocation function): ld->log will be implicitly freed when ld
 	 * is. */
-	ld->log = new_log(ld, ld->log_book, "lightningd(%u):", (int)getpid());
+	ld->log = new_log(ld, ld->log_book, NULL, "lightningd");
 	ld->logfile = NULL;
 
 	/*~ We explicitly set these to NULL: if they're still NULL after option
@@ -169,38 +192,44 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	list_head_init(&ld->sendpay_commands);
 	list_head_init(&ld->close_commands);
 	list_head_init(&ld->ping_commands);
+	list_head_init(&ld->waitblockheight_commands);
 
 	/*~ Tal also explicitly supports arrays: it stores the number of
 	 * elements, which can be accessed with tal_count() (or tal_bytelen()
 	 * for raw bytecount).  It's common for simple arrays to use
 	 * tal_resize() (or tal_arr_expand) to expand, which does not work on
-	 * NULL.  So we start with an zero-length array. */
+	 * NULL.  So we start with a zero-length array. */
 	ld->proposed_wireaddr = tal_arr(ld, struct wireaddr_internal, 0);
 	ld->proposed_listen_announce = tal_arr(ld, enum addr_listen_announce, 0);
-	ld->portnum = DEFAULT_PORT;
 	ld->listen = true;
 	ld->autolisten = true;
 	ld->reconnect = true;
+	ld->try_reexec = false;
 
 	/*~ This is from ccan/timer: it is efficient for the case where timers
 	 * are deleted before expiry (as is common with timeouts) using an
 	 * ingenious bucket system which more precisely sorts timers as they
 	 * approach expiry.  It's a fascinating implementation you should read
 	 * if you have a spare few hours. */
-	timers_init(&ld->timers, time_mono());
+	ld->timers = tal(ld, struct timers);
+	timers_init(ld->timers, time_mono());
 
 	/*~ This is detailed in chaintopology.c */
 	ld->topology = new_topology(ld, ld->log);
-	ld->daemon = false;
-	ld->config_filename = NULL;
-	ld->pidfile = NULL;
-	ld->ini_autocleaninvoice_cycle = 0;
-	ld->ini_autocleaninvoice_expiredby = 86400;
+	ld->blockheight = 0;
+	ld->daemon_parent_fd = -1;
 	ld->proxyaddr = NULL;
-	ld->use_proxy_always = false;
+	ld->always_use_proxy = false;
 	ld->pure_tor_setup = false;
 	ld->tor_service_password = NULL;
-	ld->max_funding_unconfirmed = 2016;
+	ld->websocket_port = 0;
+
+	/*~ This is initialized later, but the plugin loop examines this,
+	 * so set it to NULL explicitly now. */
+	ld->wallet = NULL;
+
+	/*~ Behavioral options */
+	ld->accept_extra_tlv_types = tal_arr(ld, u64, 0);
 
 	/*~ In the next step we will initialize the plugins. This will
 	 *  also populate the JSON-RPC with passthrough methods, hence
@@ -210,12 +239,56 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	jsonrpc_setup(ld);
 
 	/*~ We run a number of plugins (subprocesses that we talk JSON-RPC with)
-	 *alongside this process. This allows us to have an easy way for users
-	 *to add their own tools without having to modify the c-lightning source
-	 *code. Here we initialize the context that will keep track and control
-	 *the plugins.
+	 * alongside this process. This allows us to have an easy way for users
+	 * to add their own tools without having to modify the c-lightning source
+	 * code. Here we initialize the context that will keep track and control
+	 * the plugins.
 	 */
 	ld->plugins = plugins_new(ld, ld->log_book, ld);
+	ld->plugins->startup = true;
+
+	/*~ This is set when a JSON RPC command comes in to shut us down. */
+	ld->stop_conn = NULL;
+
+	/*~ This is used to signal that `hsm_secret` is encrypted, and will
+	 * be set to `true` if the `--encrypted-hsm` option is passed at startup.
+	 */
+	ld->encrypted_hsm = false;
+
+	/* This is used to override subdaemons */
+	strmap_init(&ld->alt_subdaemons);
+	tal_add_destructor(ld, destroy_alt_subdaemons);
+	memleak_add_helper(ld, memleak_help_alt_subdaemons);
+
+	/*~ We change umask if we daemonize, but not if we don't. Initialize the
+	 * initial_umask anyway as we might rely on it later (`plugin start`). */
+	ld->initial_umask = umask(0);
+	umask(ld->initial_umask);
+
+	/*~ This is the mode of the created JSON-RPC socket file, in
+	 * traditional Unix octal. 0600 means only the user that ran
+	 * lightningd can invoke RPC on it. Changing it to 0660 may
+	 * be sensible if you run lightningd in its own system user,
+	 * and just let specific users (add the group of the
+	 * lightningd runner as an ancillary group) access its
+	 * RPC. Can be overridden with `--rpc-file-mode`.
+	 */
+	ld->rpc_filemode = 0600;
+
+	/*~ This is the exit code to use on exit.
+	 * Set to NULL meaning we are not interested in exiting yet.
+	 */
+	ld->exit_code = NULL;
+
+	/*~ We maintain a round-robin list of channels.
+	 * This round-robin list of channels is used to ensure that
+	 * each invoice we generate has a different set of channels.  */
+	ld->rr_counter = 0;
+
+	/*~ Because fee estimates on testnet and regtest are unreliable,
+	 * we allow overriding them with --force-feerates, in which
+	 * case this is a pointer to an enum feerate-indexed array of values */
+	ld->force_feerates = NULL;
 
 	return ld;
 }
@@ -232,6 +305,50 @@ static const char *subdaemons[] = {
 	"lightning_openingd"
 };
 
+/* Return true if called with a recognized subdaemon e.g. "hsmd" */
+bool is_subdaemon(const char *sdname)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(subdaemons); i++)
+		/* Skip the "lightning_" prefix in the table */
+		if (streq(sdname, subdaemons[i] + strlen("lightning_")))
+			return true;
+	return false;
+}
+
+static void destroy_alt_subdaemons(struct lightningd *ld)
+{
+	strmap_clear(&ld->alt_subdaemons);
+}
+
+#if DEVELOPER
+static void memleak_help_alt_subdaemons(struct htable *memtable,
+					struct lightningd *ld)
+{
+	memleak_remove_strmap(memtable, &ld->alt_subdaemons);
+}
+#endif /* DEVELOPER */
+
+const char *subdaemon_path(const tal_t *ctx, const struct lightningd *ld, const char *name)
+{
+	/* Strip the leading "lightning_" before looking in alt_subdaemons.
+	 */
+	size_t pfxlen = strlen("lightning_");
+	assert(strlen(name) > pfxlen);
+	const char *short_name = tal_strdup(ctx, name + pfxlen);
+
+	/* Is there an alternate path for this subdaemon? */
+	const char *dpath;
+	const char *alt = strmap_get(&ld->alt_subdaemons, short_name);
+	if (alt) {
+		/* path_join will honor absolute paths as well. */
+		dpath = path_join(ctx, ld->daemon_dir, alt);
+	} else {
+		/* This subdaemon is found in the standard place. */
+		dpath = path_join(ctx, ld->daemon_dir, name);
+	}
+	return dpath;
+}
+
 /*~ Check we can run them, and check their versions */
 void test_subdaemons(const struct lightningd *ld)
 {
@@ -246,7 +363,6 @@ void test_subdaemons(const struct lightningd *ld)
 	 * ARRAY_SIZE will cause a compiler error if the argument is actually
 	 * a pointer, not an array. */
 	for (i = 0; i < ARRAY_SIZE(subdaemons); i++) {
-		int outfd;
 		/*~ CCAN's path module uses tal, so wants a context to
 		 * allocate from.  We have a magic convenience context
 		 * `tmpctx` for temporary allocations like this.
@@ -256,7 +372,8 @@ void test_subdaemons(const struct lightningd *ld)
 		 * can free `tmpctx` in that top-level loop after each event
 		 * is handled.
 		 */
-		const char *dpath = path_join(tmpctx, ld->daemon_dir, subdaemons[i]);
+		int outfd;
+		const char *dpath = subdaemon_path(tmpctx, ld, subdaemons[i]);
 		const char *verstring;
 		/*~ CCAN's pipecmd module is like popen for grownups: it
 		 * takes pointers to fill in stdin, stdout and stderr file
@@ -267,7 +384,7 @@ void test_subdaemons(const struct lightningd *ld)
 
 		/*~ Our logging system: spam goes in at log_debug level, but
 		 * logging is mainly added by developer necessity and removed
-		 * by developer/user complaints .  The only strong convention
+		 * by developer/user complaints.  The only strong convention
 		 * is that log_broken() is used for "should never happen".
 		 *
 		 * Note, however, that logging takes care to preserve the
@@ -293,10 +410,8 @@ void test_subdaemons(const struct lightningd *ld)
 		    || verstring[strlen(version())] != '\n')
 			errx(1, "%s: bad version '%s'",
 			     subdaemons[i], verstring);
-
-		/*~ finally reap the child process, freeing all OS
-		 *  resources that go with it */
-		waitpid(pid, NULL, 0);
+		/*~ The child will be reaped by sigchld_rfd_in, so we don't
+		 * need to waitpid() here. */
 	}
 }
 
@@ -361,9 +476,9 @@ static const char *find_my_pkglibexec_path(struct lightningd *ld,
 
 	/*~ The plugin dir is in ../libexec/c-lightning/plugins, which (unlike
 	 * those given on the command line) does not need to exist. */
-	add_plugin_dir(ld->plugins,
-		       path_join(tmpctx, pkglibexecdir, "plugins"),
-		       true);
+	plugins_set_builtin_plugins_dir(ld->plugins,
+					path_join(tmpctx,
+						  pkglibexecdir, "plugins"));
 
 	/*~ Sometimes take() can be more efficient, since the routine can
 	 * manipulate the string in place.  This is the case here. */
@@ -376,10 +491,11 @@ static const char *find_daemon_dir(struct lightningd *ld, const char *argv0)
 	const char *my_path = find_my_directory(ld, argv0);
 	/* If we're running in-tree, all the subdaemons are with lightningd. */
 	if (has_all_subdaemons(my_path)) {
-		/* In this case, look in ../plugins */
-		add_plugin_dir(ld->plugins,
-			       path_join(tmpctx, my_path, "../plugins"),
-			       true);
+		/* In this case, look for built-in plugins in ../plugins */
+		plugins_set_builtin_plugins_dir(ld->plugins,
+						path_join(tmpctx,
+							  my_path,
+							  "../plugins"));
 		return my_path;
 	}
 
@@ -409,9 +525,14 @@ static void shutdown_subdaemons(struct lightningd *ld)
 	close(ld->hsm_fd);
 	/*~ The three "global" daemons, which we shutdown explicitly: we
 	 * give them 10 seconds to exit gracefully before killing them.  */
-	subd_shutdown(ld->connectd, 10);
-	subd_shutdown(ld->gossip, 10);
-	subd_shutdown(ld->hsm, 10);
+	ld->connectd = subd_shutdown(ld->connectd, 10);
+	ld->gossip = subd_shutdown(ld->gossip, 10);
+	ld->hsm = subd_shutdown(ld->hsm, 10);
+
+	/*~ Closing the hsmd means all other subdaemons should be exiting;
+	 * deal with that cleanly before we start freeing internal
+	 * structures. */
+	subd_shutdown_remaining(ld);
 
 	/* Now we free all the HTLCs */
 	free_htlcs(ld, NULL);
@@ -450,17 +571,6 @@ static void shutdown_subdaemons(struct lightningd *ld)
 	db_commit_transaction(ld->wallet->db);
 }
 
-/*~ Chainparams are the parameters for eg. testnet vs mainnet.  This wrapper
- * saves lots of struggles with our 80-column guideline! */
-const struct chainparams *get_chainparams(const struct lightningd *ld)
-{
-	/* "The lightningd is connected to the blockchain."
-	 * "The blockchain is connected to the bitcoind API."
-	 * "The bitcoind API is connected chain parameters."
-	 * -- Worst childhood song ever. */
-	return ld->topology->bitcoind->chainparams;
-}
-
 /*~ Our wallet logic needs to know what outputs we might be interested in.  We
  * use BIP32 (a.k.a. "HD wallet") to generate keys from a single seed, so we
  * keep the maximum-ever-used key index in the db, and add them all to the
@@ -475,7 +585,7 @@ static void init_txfilter(struct wallet *w, struct txfilter *filter)
 
 	bip32_max_index = db_get_intvar(w->db, "bip32_max_index", 0);
 	/*~ One of the C99 things I unequivocally approve: for-loop scope. */
-	for (u64 i = 0; i <= bip32_max_index; i++) {
+	for (u64 i = 0; i <= bip32_max_index + w->keyscan_gap; i++) {
 		if (bip32_key_from_parent(w->bip32_base, i, BIP32_FLAG_KEY_PUBLIC, &ext) != WALLY_OK) {
 			abort();
 		}
@@ -487,41 +597,49 @@ static void init_txfilter(struct wallet *w, struct txfilter *filter)
  * don't prevent unmounting whatever filesystem you happen to start in.
  *
  * But we define every path relative to our (~/.lightning) data dir, so we
- * make sure we stay there.
+ * make sure we stay there.  The rest of this is taken from ccan/daemonize,
+ * which was based on W. Richard Stevens' advice in Programming in The Unix
+ * Environment.
  */
-static void daemonize_but_keep_dir(struct lightningd *ld)
+static void complete_daemonize(struct lightningd *ld)
 {
-	/* daemonize moves us into /, but we want to be here */
-	const char *cwd = path_cwd(NULL);
+	int ok_status = 0;
 
-	/*~ SQLite3 does NOT like being open across fork(), a.k.a. daemonize() */
-	db_close_for_fork(ld->wallet->db);
-	if (!cwd)
-		fatal("Could not get current directory: %s", strerror(errno));
-	if (!daemonize())
-		fatal("Could not become a daemon: %s", strerror(errno));
+	/* Don't hold files open. */
+	close(STDIN_FILENO);
+	close(STDOUT_FILENO);
+	close(STDERR_FILENO);
 
-	/*~ Move back: important, since lightning dir may be relative! */
-	if (chdir(cwd) != 0)
-		fatal("Could not return to directory %s: %s",
-		      cwd, strerror(errno));
+	/* Many routines write to stderr; that can cause chaos if used
+	 * for something else, so set it here. */
+	if (open("/dev/null", O_WRONLY) != 0)
+		fatal("Could not open /dev/null: %s", strerror(errno));
+	if (dup2(0, STDERR_FILENO) != STDERR_FILENO)
+		fatal("Could not dup /dev/null for stderr: %s", strerror(errno));
+	close(0);
 
-	db_reopen_after_fork(ld->wallet->db);
+	/* Session leader so ^C doesn't whack us. */
+	if (setsid() == (pid_t)-1)
+		fatal("Could not setsid: %s", strerror(errno));
 
-	/*~ Why not allocate cwd off tmpctx?  Probably because this code predates
-	 * tmpctx.  So we free manually here. */
-	tal_free(cwd);
+	/* Discard our parent's old-fashioned umask prejudices. */
+	ld->initial_umask = umask(0);
+
+	/* OK, parent, you can exit(0) now. */
+	write_all(ld->daemon_parent_fd, &ok_status, sizeof(ok_status));
+	close(ld->daemon_parent_fd);
 }
 
 /*~ It's pretty standard behaviour (especially for daemons) to create and
  * file-lock a pidfile.  This not only prevents accidentally running multiple
  * daemons on the same database at once, but lets nosy sysadmins see what pid
  * the currently-running daemon is supposed to be. */
-static int pidfile_create(const struct lightningd *ld)
+static void pidfile_create(const struct lightningd *ld)
 {
 	int pid_fd;
+	char *pid;
 
-	/* Create PID file */
+	/* Create PID file: relative to .config dir. */
 	pid_fd = open(ld->pidfile, O_WRONLY|O_CREAT, 0640);
 	if (pid_fd < 0)
 		err(1, "Failed to open PID file");
@@ -533,15 +651,6 @@ static int pidfile_create(const struct lightningd *ld)
 
 	/*~ As closing the file will remove the lock, we need to keep it open;
 	 * the OS will close it implicitly when we exit for any reason. */
-	return pid_fd;
-}
-
-/*~ Writing the pid into the lockfile provides a useful clue to users as to
- * what created it; however, we can't do that until we've got a stable process
- * id, and if --daemon is specified, that's quite late. */
-static void pidfile_write(const struct lightningd *ld, int pid_fd)
-{
-	char *pid;
 
 	/*~ Note that tal_fmt() is what asprintf() dreams of being. */
 	pid = tal_fmt(tmpctx, "%d\n", getpid());
@@ -558,11 +667,7 @@ static void pidfile_write(const struct lightningd *ld, int pid_fd)
  * extra sanity checks, and it's also a good point to free the tmpctx. */
 static int io_poll_lightningd(struct pollfd *fds, nfds_t nfds, int timeout)
 {
-	/*~ In particular, we should *not* have left a database transaction
-	 * open! */
-	db_assert_no_outstanding_statements();
-
-	/* The other checks and freeing tmpctx are common to all daemons. */
+	/* These checks and freeing tmpctx are common to all daemons. */
 	return daemon_poll(fds, nfds, timeout);
 }
 
@@ -576,6 +681,8 @@ void notify_new_block(struct lightningd *ld, u32 block_height)
 	/* Inform our subcomponents individually. */
 	htlcs_notify_new_block(ld, block_height);
 	channel_notify_new_block(ld, block_height);
+	gossip_notify_new_block(ld, block_height);
+	waitblockheight_notify_new_block(ld, block_height);
 }
 
 static void on_sigint(int _ UNUSED)
@@ -592,34 +699,217 @@ static void on_sigterm(int _ UNUSED)
         _exit(1);
 }
 
+/* Globals are terrible, but we all do it. */
+static int sigchld_wfd;
+
+static void on_sigchild(int _ UNUSED)
+{
+	/*~ UNIX signals are async, which is usually terrible.  The usual
+	 * trick, which we use here, it to write a byte to a pipe, and
+	 * then handle it in the main event loop.
+	 *
+	 * This can fail if we get flooded by signals but that's OK;
+	 * we made it non-blocking, and the reader will loop until
+	 * there are no more children.  But glibc's overzealous use of
+	 * __attribute__((warn_unused_result)) means we have to
+	 * "catch" the return value. */
+        if (write(sigchld_wfd, "", 1) != 1) {
+		if (errno != EAGAIN && errno != EWOULDBLOCK) {
+			/* Should not call this in a signal handler, but we're
+			 * already messed up! */
+			fatal("on_sigchild: write errno %s", strerror(errno));
+		}
+	}
+}
+
 /*~ We only need to handle SIGTERM and SIGINT for the case we are PID 1 of
  * docker container since Linux makes special this PID and requires that
- * some handler exist. */
-static void setup_sig_handlers(void)
+ * some handler exist.
+ *
+ * We also want to catch SIGCHLD, so we can report on such children and
+ * avoid zombies. */
+static int setup_sig_handlers(void)
 {
-	struct sigaction sigint, sigterm;
+	struct sigaction sigint, sigterm, sigchild;
+	int fds[2];
+
 	memset(&sigint, 0, sizeof(struct sigaction));
 	memset(&sigterm, 0, sizeof(struct sigaction));
+	memset(&sigchild, 0, sizeof(struct sigaction));
 
 	sigint.sa_handler = on_sigint;
 	sigterm.sa_handler = on_sigterm;
+	sigchild.sa_handler = on_sigchild;
+	sigchild.sa_flags = SA_RESTART;
 
 	if (1 == getpid()) {
 		sigaction(SIGINT, &sigint, NULL);
 		sigaction(SIGTERM, &sigterm, NULL);
 	}
+
+	if (pipe(fds) != 0)
+		err(1, "creating sigchild pipe");
+	sigchld_wfd = fds[1];
+	if (fcntl(sigchld_wfd, F_SETFL,
+		  fcntl(sigchld_wfd, F_GETFL)|O_NONBLOCK) != 0)
+		err(1, "setting sigchild pip nonblock");
+	sigaction(SIGCHLD, &sigchild, NULL);
+
+	return fds[0];
+}
+
+/*~ This removes the SIGCHLD handler, so we don't try to write
+ * to a broken pipe. */
+static void remove_sigchild_handler(struct io_conn *sigchld_conn)
+{
+	struct sigaction sigchild;
+
+	memset(&sigchild, 0, sizeof(struct sigaction));
+	sigchild.sa_handler = SIG_DFL;
+	sigaction(SIGCHLD, &sigchild, NULL);
+	io_close(sigchld_conn);
+}
+
+/*~ This is the routine which sets up the sigchild handling.  We just
+ * reap them for now so they don't become zombies, but our subd
+ * handling calls waitpid() synchronously, so we can't simply do this
+ * in the signal handler or set SIGCHLD to be ignored, which has the
+ * same effect.
+ *
+ * We can usually ignore these because we keep pipes to our children,
+ * and use the closure of those to indicate termination.
+ */
+static struct io_plan *sigchld_rfd_in(struct io_conn *conn,
+				      struct lightningd *ld)
+{
+	/* We don't actually care what we read, so we stuff things here. */
+	static u8 ignorebuf;
+	static size_t len;
+	pid_t childpid;
+	int wstatus;
+
+	/* Reap the plugins, since we otherwise ignore them. */
+	while ((childpid = waitpid(-1, &wstatus, WNOHANG)) != 0) {
+		maybe_subd_child(ld, childpid, wstatus);
+	}
+
+	return io_read_partial(conn, &ignorebuf, 1, &len, sigchld_rfd_in, ld);
+}
+
+/*~ We actually keep more than one set of features, used in different
+ * contexts.  common/features.c knows how each standard feature is
+ * presented, so we have it generate the set for each one at a time, and
+ * combine them.
+ *
+ * This is inefficient, but the primitives are useful for adding single
+ * features later, or adding them when supplied by plugins. */
+static struct feature_set *default_features(const tal_t *ctx)
+{
+	struct feature_set *ret = NULL;
+	static const u32 features[] = {
+		OPTIONAL_FEATURE(OPT_DATA_LOSS_PROTECT),
+		OPTIONAL_FEATURE(OPT_UPFRONT_SHUTDOWN_SCRIPT),
+		OPTIONAL_FEATURE(OPT_GOSSIP_QUERIES),
+		OPTIONAL_FEATURE(OPT_VAR_ONION),
+		COMPULSORY_FEATURE(OPT_PAYMENT_SECRET),
+		OPTIONAL_FEATURE(OPT_BASIC_MPP),
+		OPTIONAL_FEATURE(OPT_GOSSIP_QUERIES_EX),
+		OPTIONAL_FEATURE(OPT_STATIC_REMOTEKEY),
+		OPTIONAL_FEATURE(OPT_SHUTDOWN_ANYSEGWIT),
+#if EXPERIMENTAL_FEATURES
+		OPTIONAL_FEATURE(OPT_ANCHOR_OUTPUTS),
+		OPTIONAL_FEATURE(OPT_QUIESCE),
+		OPTIONAL_FEATURE(OPT_ONION_MESSAGES),
+#endif
+	};
+
+	for (size_t i = 0; i < ARRAY_SIZE(features); i++) {
+		struct feature_set *f
+			= feature_set_for_feature(NULL, features[i]);
+		if (!ret)
+			ret = tal_steal(ctx, f);
+		else
+			feature_set_or(ret, take(f));
+	}
+
+	return ret;
+}
+
+/*~ We need this function style to hand to ecdh_hsmd_setup, but it's just a thin
+ * wrapper around fatal() */
+static void hsm_ecdh_failed(enum status_failreason fail,
+			    const char *fmt, ...)
+{
+	fatal("hsm failure: %s", fmt);
+}
+
+/*~ This signals to the mainloop that some part wants to cleanly exit now.  */
+void lightningd_exit(struct lightningd *ld, int exit_code)
+{
+	ld->exit_code = tal(ld, int);
+	*ld->exit_code = exit_code;
+	io_break(ld);
 }
 
 int main(int argc, char *argv[])
 {
 	struct lightningd *ld;
 	u32 min_blockheight, max_blockheight;
-	int connectd_gossipd_fd, pid_fd;
+	int connectd_gossipd_fd;
+	int stop_fd;
+	struct timers *timers;
+	const char *stop_response;
+	struct htlc_in_map *unconnected_htlcs_in;
+	struct ext_key *bip32_base;
+	int sigchld_rfd;
+	struct io_conn *sigchld_conn;
+	int exit_code = 0;
+	char **orig_argv;
+	bool try_reexec;
+
+	/*~ We fork out new processes very very often; every channel gets its
+	 * own process, for example, and we have `hsmd` and `gossipd` and
+	 * the plugins as well.
+	 * Now, we also keep around several file descriptors (`fd`s), including
+	 * file descriptors to communicate with `hsmd` which is a privileged
+	 * process with access to private keys and is therefore very sensitive.
+	 * Thus, we need to close all file descriptors other than what the
+	 * forked-out new process should have ASAP.
+	 *
+	 * We do this by using the `ccan/closefrom` module, which implements
+	 * an emulation for the `closefrom` syscall on BSD and Solaris.
+	 * This emulation tries to use the fastest facility available on the
+	 * system (`close_range` syscall on Linux 5.9+, snooping through
+	 * `/proc/$PID/fd` on many OSs (but requires procps to be mounted),
+	 * the actual `closefrom` call if available, etc.).
+	 * As a fallback if none of those are available on the system, however,
+	 * it just iterates over the theoretical range of possible file
+	 * descriptors.
+	 *
+	 * On some systems, that theoretical range can be very high, up to
+	 * `INT_MAX` in the worst case.
+	 * If the `closefrom` emulation has to fall back to this loop, it
+	 * can be very slow; fortunately, the emulation will also inform
+	 * us of that via the `closefrom_may_be_slow` function, and also has
+	 * `closefrom_limit` to limit the number of allowed file descriptors
+	 * *IF AND ONLY IF* `closefrom_may_be_slow()` is true.
+	 *
+	 * On systems with a fast `closefrom` then `closefrom_limit` does
+	 * nothing.
+	 *
+	 * Previously we always imposed a limit of 1024 file descriptors
+	 * (because we used to always iterate up to limit instead of using
+	 * some OS facility, because those were non-portable and needed
+	 * code for each OS), until @whitslack went and made >1000 channels
+	 * and hit the 1024 limit.
+	 */
+	closefrom_limit(4096);
 
 	/*~ What happens in strange locales should stay there. */
 	setup_locale();
 
-	setup_sig_handlers();
+	/*~ This sets up SIGCHLD to make sigchld_rfd readable. */
+	sigchld_rfd = setup_sig_handlers();
 
 	/*~ This checks that the system-installed libraries (usually
 	 * dynamically linked) actually are compatible with the ones we
@@ -642,43 +932,66 @@ int main(int argc, char *argv[])
 	 * valgrind will warn us if we make decisions based on uninitialized
 	 * variables. */
 	ld = new_lightningd(NULL);
+	ld->state = LD_STATE_RUNNING;
+
+	/*~ We store an copy of our arguments before parsing mangles them, so
+	 * we can re-exec if versions of subdaemons change.  Note the use of
+	 * notleak() since our leak-detector can't find orig_argv on the
+	 * stack. */
+	orig_argv = notleak(tal_arr(ld, char *, argc + 1));
+	for (size_t i = 1; i < argc; i++)
+		orig_argv[i] = tal_strdup(orig_argv, argv[i]);
+	/*~ Turn argv[0] into an absolute path (if not already) */
+	orig_argv[0] = path_join(orig_argv, take(path_cwd(NULL)), argv[0]);
+	orig_argv[argc] = NULL;
 
 	/* Figure out where our daemons are first. */
 	ld->daemon_dir = find_daemon_dir(ld, argv[0]);
 	if (!ld->daemon_dir)
 		errx(1, "Could not find daemons");
 
-	/*~ The ccan/opt code requires registration then parsing; we
-	 *  mimic this API here, even though they're on separate lines.*/
-	register_opts(ld);
+	/* Set up the feature bits for what we support */
+	ld->our_features = default_features(ld);
 
-	/*~ Handle early options, but don't move to --lightning-dir
-	 *  just yet. Plugins may add new options, which is why we are
-	 *  splitting between early args (including --plugin
-	 *  registration) and non-early opts. */
+	/*~ Handle early options; this moves us into --lightning-dir.
+	 * Plugins may add new options, which is why we are splitting
+	 * between early args (including --plugin registration) and
+	 * non-early opts.  This also forks if they say --daemon. */
 	handle_early_opts(ld, argc, argv);
+
+	/*~ Set the default portnum according to the used network
+	 * similarly to what Bitcoin Core does to ports by default. */
+	ld->portnum = DEFAULT_PORT + chainparams->rpc_port - 8332;
 
 	/*~ Initialize all the plugins we just registered, so they can
 	 *  do their thing and tell us about themselves (including
 	 *  options registration). */
-	plugins_init(ld->plugins, ld->dev_debug_subprocess);
+	plugins_init(ld->plugins);
 
-	/*~ Handle options and config; move to .lightningd (--lightning-dir) */
+	/*~ If the plugis are misconfigured we don't want to proceed. A
+	 * misconfiguration could for example be a plugin marked as important
+	 * not working correctly or a plugin squatting something an important
+	 * plugin needs to register, such as a method or CLI option. If we are
+	 * going to shut down immediately again, we shouldn't spend too much
+	 * effort in starting up.
+	 */
+	if (ld->exit_code)
+		fatal("Could not initialize the plugins, see above for details.");
+
+	/*~ Handle options and config. */
 	handle_opts(ld, argc, argv);
 
-	/*~ Make sure we can reach the subdaemons, and versions match. */
-	test_subdaemons(ld);
+	/*~ Now create the PID file: this errors out if there's already a
+	 * daemon running, so we call before doing almost anything else. */
+	pidfile_create(ld);
 
-	/*~ Our "wallet" code really wraps the db, which is more than a simple
-	 * bitcoin wallet (though it's that too).  It also stores channel
-	 * states, invoices, payments, blocks and bitcoin transactions. */
-	ld->wallet = wallet_new(ld, ld->log, &ld->timers);
-
-	/*~ We keep a filter of scriptpubkeys we're interested in. */
-	ld->owned_txfilter = txfilter_new(ld);
-
-	/*~ This is the ccan/io central poll override from above. */
-	io_poll_override(io_poll_lightningd);
+	/*~ Make sure we can reach the subdaemons, and versions match.
+	 * This can be turned off in DEVELOPER builds with --dev-skip-version-checks,
+	 * but the `dev_no_version_checks` field of `ld` doesn't even exist
+	 * if DEVELOPER isn't defined, so we use IFDEV(devoption,non-devoption):
+	 */
+	if (IFDEV(!ld->dev_no_version_checks, 1))
+		test_subdaemons(ld);
 
 	/*~ Set up the HSM daemon, which knows our node secret key, so tells
 	 *  us who we are.
@@ -687,7 +1000,23 @@ int main(int argc, char *argv[])
 	 * standard of key storage; ours is in software for now, so the name
 	 * doesn't really make sense, but we can't call it the Badly-named
 	 * Daemon Software Module. */
-	hsm_init(ld);
+	bip32_base = hsm_init(ld);
+
+	/*~ Our "wallet" code really wraps the db, which is more than a simple
+	 * bitcoin wallet (though it's that too).  It also stores channel
+	 * states, invoices, payments, blocks and bitcoin transactions. */
+	ld->wallet = wallet_new(ld, ld->timers, bip32_base);
+
+	/*~ We keep a filter of scriptpubkeys we're interested in. */
+	ld->owned_txfilter = txfilter_new(ld);
+
+	/*~ This is the ccan/io central poll override from above. */
+	io_poll_override(io_poll_lightningd);
+
+	/*~ If hsm_secret is encrypted, we don't need its encryption key
+	 * anymore. Note that sodium_munlock() also zeroes the memory.*/
+	if (ld->config.keypass)
+		discard_key(take(ld->config.keypass));
 
 	/*~ Our default color and alias are derived from our node id, so we
 	 * can only set those now (if not set by config options). */
@@ -700,11 +1029,6 @@ int main(int argc, char *argv[])
 	 * socket pair, and gives us the other */
 	connectd_gossipd_fd = connectd_init(ld);
 
- 	/*~ The gossip daemon looks after the routing gossip;
-	 *  channel_announcement, channel_update, node_announcement and gossip
-	 *  queries. */
-	gossip_init(ld, connectd_gossipd_fd);
-
 	/*~ We do every database operation within a transaction; usually this
 	 * is covered by the infrastructure (eg. opening a transaction before
 	 * handling a message or expiring a timer), but for startup we do this
@@ -714,19 +1038,11 @@ int main(int argc, char *argv[])
 	/*~ Our default names, eg. for the database file, are not dependent on
 	 * the network.  Instead, the db knows what chain it belongs to, and we
 	 * simple barf here if it's wrong. */
-	if (!wallet_network_check(ld->wallet, get_chainparams(ld)))
+	if (!wallet_network_check(ld->wallet))
 		errx(1, "Wallet network check failed.");
 
 	/*~ Initialize the transaction filter with our pubkeys. */
 	init_txfilter(ld->wallet, ld->owned_txfilter);
-
-	/*~ Set up invoice autoclean. */
-	wallet_invoice_autoclean(ld->wallet,
-				 ld->ini_autocleaninvoice_cycle,
-				 ld->ini_autocleaninvoice_expiredby);
-
-	/*~ Pull peers, channels and HTLCs from db. */
-	load_channels_from_wallet(ld);
 
 	/*~ Get the blockheight we are currently at, UINT32_MAX is used to signal
 	 * an uninitialized wallet and that we should start off of bitcoind's
@@ -749,12 +1065,21 @@ int main(int argc, char *argv[])
 
 	/*~ Initialize block topology.  This does its own io_loop to
 	 * talk to bitcoind, so does its own db transactions. */
-	setup_topology(ld->topology, &ld->timers,
-		       min_blockheight, max_blockheight);
+	setup_topology(ld->topology, min_blockheight, max_blockheight);
 
-	/*~ Now create the PID file: this errors out if there's already a
-	 * daemon running, so we call before trying to create an RPC socket. */
-	pid_fd = pidfile_create(ld);
+	db_begin_transaction(ld->wallet->db);
+
+	/*~ Pull peers, channels and HTLCs from db. Needs to happen after the
+	 *  topology is initialized since some decisions rely on being able to
+	 *  know the blockheight. */
+	unconnected_htlcs_in = load_channels_from_wallet(ld);
+	db_commit_transaction(ld->wallet->db);
+
+ 	/*~ The gossip daemon looks after the routing gossip;
+	 *  channel_announcement, channel_update, node_announcement and gossip
+	 *  queries.   It also hands us the latest channel_updates for our
+	 *  channels. */
+	gossip_init(ld, connectd_gossipd_fd);
 
 	/*~ Create RPC socket: now lightning-cli can send us JSON RPC commands
 	 *  over a UNIX domain socket specified by `ld->rpc_filename`. */
@@ -764,20 +1089,13 @@ int main(int argc, char *argv[])
 	 * can start talking to us. */
 	plugins_config(ld->plugins);
 
-	/*~ Setting this (global) activates the crash log: we don't usually need
-	 * a backtrace if we fail during startup.  We do this before daemonize,
-	 * in case that runs into trouble. */
-	crashlog = ld->log;
-
-	/*~ We defer --daemon until we've completed most initialization: that
-	 *  way we'll exit with an error rather than silently exiting 0, then
-	 *  realizing we can't start and forcing the confused user to read the
-	 *  logs. */
-	if (ld->daemon)
-		daemonize_but_keep_dir(ld);
-
-	/*~ We have to do this after daemonize, since that changes our pid! */
-	pidfile_write(ld, pid_fd);
+	/*~ Process any HTLCs we were in the middle of when we exited, now
+	 * that plugins (who might want to know via htlc_accepted hook) are
+	 * active.  These will immediately fail, since no peers are connected,
+	 * however partial payments may still be absorbed into htlc_set. */
+	db_begin_transaction(ld->wallet->db);
+	htlcs_resubmit(ld, unconnected_htlcs_in);
+	db_commit_transaction(ld->wallet->db);
 
 	/*~ Activate connect daemon.  Needs to be after the initialization of
 	 * chaintopology, otherwise peers may connect and ask for
@@ -791,6 +1109,9 @@ int main(int argc, char *argv[])
 	 * "funding transaction spent" event which creates it. */
 	onchaind_replay_channels(ld);
 
+	/*~ Now handle sigchld, so we can clean up appropriately. */
+	sigchld_conn = notleak(io_new_conn(ld, sigchld_rfd, sigchld_rfd_in, ld));
+
 	/*~ Mark ourselves live.
 	 *
 	 * Note the use of type_to_string() here: it's a typesafe formatter,
@@ -799,10 +1120,27 @@ int main(int argc, char *argv[])
 	 * log.  And tal_hex() is a helper from utils which returns a hex string;
 	 * it's assumed that the argument was allocated with tal or tal_arr
 	 * so it can use tal_bytelen() to get the length. */
+	log_info(ld->log, "--------------------------------------------------");
 	log_info(ld->log, "Server started with public key %s, alias %s (color #%s) and lightningd %s",
-		 type_to_string(tmpctx, struct pubkey, &ld->id),
+		 type_to_string(tmpctx, struct node_id, &ld->id),
 		 json_escape(tmpctx, (const char *)ld->alias)->s,
 		 tal_hex(tmpctx, ld->rgb), version());
+
+	/*~ If `closefrom_may_be_slow`, we limit ourselves to 4096 file
+	 * descriptors; tell the user about it as that limits the number
+	 * of channels they can have.
+	 * We do not really expect most users to ever reach that many,
+	 * but: https://github.com/ElementsProject/lightning/issues/4868
+	 */
+	if (closefrom_may_be_slow())
+		log_info(ld->log,
+			 "We have self-limited number of open file "
+			 "descriptors to 4096, but that will result in a "
+			 "'Too many open files' error if you ever reach "
+			 ">4000 channels.  Please upgrade your OS kernel "
+			 "(Linux 5.9+, FreeBSD 8.0+), or mount proc or "
+			 "/dev/fd (if running in chroot) if you are "
+			 "approaching that many channels.");
 
 	/*~ This is where we ask connectd to reconnect to any peers who have
 	 * live channels with us, and makes sure we're watching the funding
@@ -813,54 +1151,104 @@ int main(int argc, char *argv[])
 	 *  can start the poll loop which queries bitcoind for new blocks. */
 	begin_topology(ld->topology);
 
+	/*~ To handle --daemon, we fork the daemon early (otherwise we hit
+	 * issues with our pid changing), but keep the parent around until
+	 * we've completed most initialization: that way we'll exit with an
+	 * error rather than silently exiting 0, then realizing we can't start
+	 * and forcing the confused user to read the logs.
+	 *
+	 * But we're all initialized, so detach and have parent exit now. */
+	if (ld->daemon_parent_fd != -1)
+		complete_daemonize(ld);
+
+	/*~ Setting this (global) activates the crash log: we don't usually need
+	 * a backtrace if we fail during startup. */
+	crashlog = ld->log;
+
+	/*~ This sets up the ecdh() function in ecdh_hsmd to talk to hsmd */
+	ecdh_hsmd_setup(ld->hsm_fd, hsm_ecdh_failed);
+
 	/*~ The root of every backtrace (almost).  This is our main event
 	 *  loop. */
-	for (;;) {
-		/* ~ccan/io's io_loop() continuously calls
-		 * io_poll_lightningd() for all file descriptors registered
-		 * with it, then calls their callbacks or closes them if they
-		 * fail, as appropriate.
-		 *
-		 * It will only exit if there's an expired timer, *or* someone
-		 * calls io_break, or if there are no more file descriptors
-		 * (which never happens in our code). */
-		struct timer *expired;
-		void *v = io_loop(&ld->timers, &expired);
+	void *io_loop_ret = io_loop_with_timers(ld);
+	/*~ io_loop_with_timers will only exit if we call io_break.
+	 *  At this point in code, we should use io_break(ld) to
+	 *  shut down.
+	 */
+	assert(io_loop_ret == ld);
 
-		/*~ We use io_break(ld) to shut down. */
-		if (v == ld)
-			break;
+	/* Fail JSON RPC requests and ignore plugin's responses */
+	ld->state = LD_STATE_SHUTDOWN;
 
-		/*~ Notice that timers are called here in the event loop like
-		 * anything else, so there are no weird concurrency issues. */
-		if (expired) {
-			db_begin_transaction(ld->wallet->db);
-			timer_expired(ld, expired);
-			db_commit_transaction(ld->wallet->db);
-		}
+	stop_fd = -1;
+	stop_response = NULL;
+
+	/* Were we exited via `lightningd_exit`?  */
+	if (ld->exit_code) {
+		exit_code = *ld->exit_code;
+	} else if (ld->stop_conn) {
+		/* Keep this fd around, to write final response at the end. */
+		stop_fd = io_conn_fd(ld->stop_conn);
+		io_close_taken_fd(ld->stop_conn);
+		stop_response = tal_steal(NULL, ld->stop_response);
 	}
 
+	/* Stop topology callbacks. */
+	stop_topology(ld->topology);
+
+	/* We're not going to collect our children. */
+	remove_sigchild_handler(sigchld_conn);
 	shutdown_subdaemons(ld);
 
-	tal_free(ld->plugins);
+	/* Tell plugins we're shutting down, closes the db. */
+	shutdown_plugins(ld);
 
-	/* Clean up the JSON-RPC. This needs to happen in a DB transaction since
-	 * it might actually be touching the DB in some destructors, e.g.,
-	 * unreserving UTXOs (see #1737) */
-	db_begin_transaction(ld->wallet->db);
+	/* Cleanup JSON RPC separately: destructors assume some list_head * in ld */
 	tal_free(ld->jsonrpc);
-	db_commit_transaction(ld->wallet->db);
+
+	/* Clean our our HTLC maps, since they use malloc. */
+	htlc_in_map_clear(&ld->htlcs_in);
+	htlc_out_map_clear(&ld->htlcs_out);
 
 	remove(ld->pidfile);
 
 	/* FIXME: pay can have children off tmpctx which unlink from
 	 * ld->payments, so clean that up. */
 	clean_tmpctx();
+
+	/* Gather these before we free ld! */
+	try_reexec = ld->try_reexec;
+	if (try_reexec)
+		tal_steal(NULL, orig_argv);
+
+	/* Free this last: other things may clean up timers. */
+	timers = tal_steal(NULL, ld->timers);
 	tal_free(ld);
+
+	timers_cleanup(timers);
+	tal_free(timers);
 	opt_free_table();
 
 	daemon_shutdown();
 
+	/* Finally, send response to shutdown command if appropriate.  */
+	if (stop_fd >= 0) {
+		write_all(stop_fd, stop_response, strlen(stop_response));
+		close(stop_fd);
+		tal_free(stop_response);
+	}
+
+	/* Were we supposed to restart ourselves? */
+	if (try_reexec) {
+		/* Give a reasonable chance for the install to finish. */
+		sleep(5);
+
+		/* Close all filedescriptors except stdin/stdout/stderr */
+		closefrom(STDERR_FILENO + 1);
+		execv(orig_argv[0], orig_argv);
+		err(1, "Failed to re-exec ourselves after version change");
+	}
+
 	/*~ Farewell.  Next stop: hsmd/hsmd.c. */
-	return 0;
+	return exit_code;
 }

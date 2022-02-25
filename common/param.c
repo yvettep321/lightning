@@ -1,9 +1,9 @@
+#include "config.h"
 #include <ccan/asort/asort.h>
 #include <ccan/tal/str/str.h>
 #include <common/json_command.h>
-#include <common/jsonrpc_errors.h>
+#include <common/json_tok.h>
 #include <common/param.h>
-#include <common/utils.h>
 
 struct param {
 	const char *name;
@@ -124,7 +124,7 @@ static struct command_result *parse_by_name(struct command *cmd,
 		if (!p) {
 			if (!allow_extra) {
 				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "unknown parameter: %.*s",
+						    "unknown parameter: %.*s, this may be caused by a failure to autodetect key=value-style parameters. Please try using the -k flag and explicit key=value pairs of parameters.",
 						    t->end - t->start,
 						    buffer + t->start);
 			}
@@ -214,8 +214,7 @@ static bool check_params(struct param *params)
 		return false;
 
 	/* duplicate so we can sort */
-	struct param *copy = tal_dup_arr(params, struct param,
-					 params, tal_count(params), 0);
+	struct param *copy = tal_dup_talarr(params, struct param, params);
 
 	/* check for repeated names and args */
 	if (!check_unique(copy, comp_by_name))
@@ -263,6 +262,49 @@ static struct command_result *param_arr(struct command *cmd, const char *buffer,
 			    "Expected array or object for params");
 }
 
+const char *param_subcommand(struct command *cmd, const char *buffer,
+			     const jsmntok_t tokens[],
+			     const char *name, ...)
+{
+	va_list ap;
+	struct param *params = tal_arr(cmd, struct param, 0);
+	const char *arg, **names = tal_arr(tmpctx, const char *, 1);
+	const char *subcmd;
+
+	param_add(&params, "subcommand", true, (void *)param_string, &subcmd);
+	names[0] = name;
+	va_start(ap, name);
+	while ((arg = va_arg(ap, const char *)) != NULL)
+		tal_arr_expand(&names, arg);
+	va_end(ap);
+
+	if (command_usage_only(cmd)) {
+		char *usage = tal_strdup(cmd, "subcommand");
+		for (size_t i = 0; i < tal_count(names); i++)
+			tal_append_fmt(&usage, "%c%s",
+				       i == 0 ? '=' : '|', names[i]);
+		command_set_usage(cmd, usage);
+		return NULL;
+	}
+
+	/* Check it's valid */
+	if (param_arr(cmd, buffer, tokens, params, true) != NULL) {
+		return NULL;
+	}
+
+	/* Check it's one of the known ones. */
+	for (size_t i = 0; i < tal_count(names); i++)
+		if (streq(subcmd, names[i]))
+			return subcmd;
+
+	/* We really do ignore this. */
+	struct command_result *ignore;
+	ignore = command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			      "Unknown subcommand '%s'", subcmd);
+	assert(ignore);
+	return NULL;
+}
+
 bool param(struct command *cmd, const char *buffer,
 	   const jsmntok_t tokens[], ...)
 {
@@ -282,9 +324,10 @@ bool param(struct command *cmd, const char *buffer,
 		}
 		if  (!param_add(&params, name, required, cbx, arg)) {
 			/* We really do ignore this return! */
-			if (command_fail(cmd, PARAM_DEV_ERROR,
-					 "developer error: param_add %s", name))
-				;
+			struct command_result *ignore;
+			ignore = command_fail(cmd, PARAM_DEV_ERROR,
+					      "developer error: param_add %s", name);
+			assert(ignore);
 			va_end(ap);
 			return false;
 		}

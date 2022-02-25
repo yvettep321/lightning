@@ -1,5 +1,3 @@
-#include <bitcoin/chainparams.h>
-#include <ccan/array_size/array_size.h>
 /*~ Welcome to the gossip daemon: keeper of maps!
  *
  * This is the last "global" daemon; it has three purposes.
@@ -12,159 +10,31 @@
  * The gossip protocol itself is fairly simple, but has some twists which
  * add complexity to this daemon.
  */
-#include <ccan/asort/asort.h>
-#include <ccan/bitmap/bitmap.h>
-#include <ccan/build_assert/build_assert.h>
+#include "config.h"
 #include <ccan/cast/cast.h>
-#include <ccan/container_of/container_of.h>
-#include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
-#include <ccan/crypto/siphash24/siphash24.h>
-#include <ccan/endian/endian.h>
-#include <ccan/fdpass/fdpass.h>
-#include <ccan/io/fdpass/fdpass.h>
-#include <ccan/io/io.h>
-#include <ccan/list/list.h>
-#include <ccan/mem/mem.h>
-#include <ccan/noerr/noerr.h>
-#include <ccan/take/take.h>
 #include <ccan/tal/str/str.h>
-#include <ccan/timer/timer.h>
-#include <common/bech32.h>
-#include <common/bech32_util.h>
-#include <common/cryptomsg.h>
 #include <common/daemon_conn.h>
-#include <common/decode_short_channel_ids.h>
-#include <common/features.h>
+#include <common/ecdh_hsmd.h>
+#include <common/lease_rates.h>
 #include <common/memleak.h>
-#include <common/ping.h>
+#include <common/private_channel_announcement.h>
 #include <common/pseudorand.h>
 #include <common/status.h>
 #include <common/subdaemon.h>
 #include <common/timeout.h>
 #include <common/type_to_string.h>
-#include <common/utils.h>
-#include <common/version.h>
 #include <common/wire_error.h>
-#include <common/wireaddr.h>
-#include <connectd/gen_connect_gossip_wire.h>
+#include <connectd/connectd_gossipd_wiregen.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <gossipd/broadcast.h>
-#include <gossipd/gen_gossip_peerd_wire.h>
-#include <gossipd/gen_gossip_wire.h>
+#include <gossipd/gossip_generation.h>
+#include <gossipd/gossip_store_wiregen.h>
+#include <gossipd/gossipd.h>
+#include <gossipd/gossipd_peerd_wiregen.h>
+#include <gossipd/gossipd_wiregen.h>
+#include <gossipd/queries.h>
 #include <gossipd/routing.h>
-#include <hsmd/gen_hsm_wire.h>
-#include <inttypes.h>
-#include <lightningd/gossip_msg.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <secp256k1_ecdh.h>
-#include <sodium/randombytes.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/un.h>
-#include <unistd.h>
-#include <wire/gen_peer_wire.h>
-#include <wire/wire_io.h>
-#include <wire/wire_sync.h>
-#include <zlib.h>
-
-/* We talk to `hsmd` to sign our gossip messages with the node key */
-#define HSM_FD 3
-/* connectd asks us for help finding nodes, and gossip fds for new peers */
-#define CONNECTD_FD 4
-
-/* In developer mode we provide hooks for whitebox testing */
-#if DEVELOPER
-static u32 max_scids_encode_bytes = -1U;
-static bool suppress_gossip = false;
-#endif
-
-/*~ The core daemon structure: */
-struct daemon {
-	/* Who am I?  Helps us find ourself in the routing map. */
-	struct pubkey id;
-
-	/* Peers we are gossiping to: id is unique */
-	struct list_head peers;
-
-	/* Connection to lightningd. */
-	struct daemon_conn *master;
-
-	/* Connection to connect daemon. */
-	struct daemon_conn *connectd;
-
-	/* Routing information */
-	struct routing_state *rstate;
-
-	/* chainhash for checking/making gossip msgs */
-	struct bitcoin_blkid chain_hash;
-
-	/* Timers: we batch gossip, and also refresh announcements */
-	struct timers timers;
-
-	/* How often we flush gossip (60 seconds unless DEVELOPER override) */
-	u32 broadcast_interval_msec;
-
-	/* Global features to list in node_announcement. */
-	u8 *globalfeatures;
-
-	/* Alias (not NUL terminated) and favorite color for node_announcement */
-	u8 alias[32];
-	u8 rgb[3];
-
-	/* What addresses we can actually announce. */
-	struct wireaddr *announcable;
-};
-
-/* This represents each peer we're gossiping with */
-struct peer {
-	/* daemon->peers */
-	struct list_node list;
-
-	/* parent pointer. */
-	struct daemon *daemon;
-
-	/* The ID of the peer (always unique) */
-	struct pubkey id;
-
-	/* The two features gossip cares about (so far) */
-	bool gossip_queries_feature, initial_routing_sync_feature;
-
-	/* High water mark for the staggered broadcast */
-	u64 broadcast_index;
-
-	/* Timestamp range the peer asked us to filter gossip by */
-	u32 gossip_timestamp_min, gossip_timestamp_max;
-
-	/* Are there outstanding queries on short_channel_ids? */
-	const struct short_channel_id *scid_queries;
-	size_t scid_query_idx;
-
-	/* Are there outstanding node_announcements from scid_queries? */
-	struct pubkey *scid_query_nodes;
-	size_t scid_query_nodes_idx;
-
-	/* If this is NULL, we're syncing gossip now. */
-	struct oneshot *gossip_timer;
-
-	/* How many query responses are we expecting? */
-	size_t num_scid_queries_outstanding;
-
-	/* How many pongs are we expecting? */
-	size_t num_pings_outstanding;
-
-	/* Map of outstanding channel_range requests. */
-	bitmap *query_channel_blocks;
-	/* What we're querying: [range_first_blocknum, range_end_blocknum) */
-	u32 range_first_blocknum, range_end_blocknum;
-	u32 range_blocks_remaining;
-	struct short_channel_id *query_channel_scids;
-
-	/* The daemon_conn used to queue messages to/from the peer. */
-	struct daemon_conn *dc;
-};
+#include <gossipd/seeker.h>
+#include <sodium/crypto_aead_chacha20poly1305.h>
 
 /*~ A channel consists of a `struct half_chan` for each direction, each of
  * which has a `flags` word from the `channel_update`; bit 1 is
@@ -172,13 +42,32 @@ struct peer {
  * whole-channel flag which indicates it's not available; we use this when a
  * peer disconnects, and generate a `channel_update` to tell the world lazily
  * when someone asks. */
-static void peer_disable_channels(struct daemon *daemon, struct node *node)
+static void peer_disable_channels(struct daemon *daemon, const struct node *node)
 {
 	/* If this peer had a channel with us, mark it disabled. */
-	for (size_t i = 0; i < tal_count(node->chans); i++) {
-		struct chan *c = node->chans[i];
-		if (pubkey_eq(&other_node(node, c)->id, &daemon->id))
-			c->local_disabled = true;
+	struct chan_map_iter i;
+	const struct chan *c;
+
+	for (c = first_chan(node, &i); c; c = next_chan(node, &i)) {
+		int direction;
+		if (!local_direction(daemon->rstate, c, &direction))
+			continue;
+		local_disable_chan(daemon, c, direction);
+	}
+}
+
+/*~ This cancels the soft-disables when the peer reconnects. */
+static void peer_enable_channels(struct daemon *daemon, const struct node *node)
+{
+	/* If this peer had a channel with us, mark it disabled. */
+	struct chan_map_iter i;
+	const struct chan *c;
+
+	for (c = first_chan(node, &i); c; c = next_chan(node, &i)) {
+		int direction;
+		if (!local_direction(daemon->rstate, c, &direction))
+			continue;
+		local_enable_chan(daemon, c, direction);
 	}
 }
 
@@ -200,284 +89,117 @@ static void destroy_peer(struct peer *peer)
 	node = get_node(peer->daemon->rstate, &peer->id);
 	if (node)
 		peer_disable_channels(peer->daemon, node);
-
-	/* This is tricky: our lifetime is tied to the daemon_conn; it's our
-	 * parent, so we are freed if it is, but we need to free it if we're
-	 * freed manually.  tal_free() treats this as a noop if it's already
-	 * being freed */
-	tal_free(peer->dc);
 }
 
 /* Search for a peer. */
-static struct peer *find_peer(struct daemon *daemon, const struct pubkey *id)
+struct peer *find_peer(struct daemon *daemon, const struct node_id *id)
 {
 	struct peer *peer;
 
 	list_for_each(&daemon->peers, peer, list)
-		if (pubkey_eq(&peer->id, id))
+		if (node_id_eq(&peer->id, id))
 			return peer;
 	return NULL;
 }
 
-/* Queue a gossip message for the peer: we wrap every gossip message; the
- * subdaemon simply unwraps and sends.  Note that we don't wrap messages
- * coming from the subdaemon to gossipd, because gossipd has to process the
- * messages anyway (and it doesn't trust the subdaemon); the subdaemon
- * trusts gossipd and will forward whatever it's told to. */
-static void queue_peer_msg(struct peer *peer, const u8 *msg TAKES)
+/* Increase a peer's gossip_counter, if peer not NULL */
+void peer_supplied_good_gossip(struct peer *peer, size_t amount)
 {
-	const u8 *send = towire_gossipd_send_gossip(NULL, msg);
-	/* Autogenerated functions don't take(), so we do here */
+	if (peer)
+		peer->gossip_counter += amount;
+}
+
+/* Queue a gossip message for the peer: connectd simply forwards it to
+ * the peer. */
+void queue_peer_msg(struct peer *peer, const u8 *msg TAKES)
+{
+	u8 *outermsg = towire_gossipd_send_gossip(NULL, &peer->id, msg);
+	daemon_conn_send(peer->daemon->connectd, take(outermsg));
+
 	if (taken(msg))
 		tal_free(msg);
-	daemon_conn_send(peer->dc, take(send));
 }
 
-/* This pokes daemon_conn, which calls dump_gossip: the NULL gossip_timer
- * tells it that the gossip timer has expired and it should send any queued
- * gossip messages. */
-static void wake_gossip_out(struct peer *peer)
+/*~ We have a helper for messages from the store. */
+void queue_peer_from_store(struct peer *peer,
+			   const struct broadcastable *bcast)
 {
-	/* If we were waiting, we're not any more */
-	peer->gossip_timer = tal_free(peer->gossip_timer);
-
-	/* Notify the daemon_conn-write loop */
-	daemon_conn_wake(peer->dc);
+	struct gossip_store *gs = peer->daemon->rstate->gs;
+	queue_peer_msg(peer, take(gossip_store_get(NULL, gs, bcast->index)));
 }
 
-/* BOLT #7:
- *
- * There are several messages which contain a long array of
- * `short_channel_id`s (called `encoded_short_ids`) so we utilize a
- * simple compression scheme: the first byte indicates the encoding, the
- * rest contains the data.
- */
-static u8 *encode_short_channel_ids_start(const tal_t *ctx)
+/*~ We don't actually keep node_announcements in memory; we keep them in
+ * a file called `gossip_store`.  If we need some node details, we reload
+ * and reparse.  It's slow, but generally rare. */
+static bool get_node_announcement(const tal_t *ctx,
+				  struct daemon *daemon,
+				  const struct node *n,
+				  u8 rgb_color[3],
+				  u8 alias[32],
+				  u8 **features,
+				  struct wireaddr **wireaddrs,
+				  struct lease_rates **rates)
 {
-	u8 *encoded = tal_arr(ctx, u8, 0);
-	towire_u8(&encoded, SHORTIDS_ZLIB);
-	return encoded;
-}
+	const u8 *msg;
+	struct node_id id;
+	secp256k1_ecdsa_signature signature;
+	u32 timestamp;
+	u8 *addresses;
+	struct tlv_node_ann_tlvs *na_tlvs;
 
-/* Marshal a single short_channel_id */
-static void encode_add_short_channel_id(u8 **encoded,
-					const struct short_channel_id *scid)
-{
-	towire_short_channel_id(encoded, scid);
-}
+	if (!n->bcast.index)
+		return false;
 
-/* Greg Maxwell asked me privately about using zlib for communicating a set,
- * and suggested that we'd be better off using Golomb-Rice coding a-la BIP
- * 158.  However, naively using Rice encoding isn't a win: we have to get
- * more complex and use separate streams.  The upside is that it's between
- * 2 and 5 times smaller (assuming optimal Rice encoding + gzip).  We can add
- * that later. */
-static u8 *zencode_scids(const tal_t *ctx, const u8 *scids, size_t len)
-{
-	u8 *z;
-	int err;
-	unsigned long compressed_len = len;
+	msg = gossip_store_get(tmpctx, daemon->rstate->gs, n->bcast.index);
 
-	/* Prefer to fail if zlib makes it larger */
-	z = tal_arr(ctx, u8, len);
-	err = compress2(z, &compressed_len, scids, len, Z_BEST_COMPRESSION);
-	if (err == Z_OK) {
-		status_trace("short_ids compressed %zu into %lu",
-			     len, compressed_len);
-		tal_resize(&z, compressed_len);
-		return z;
-	}
-	status_trace("short_ids compress %zu returned %i:"
-		     " not compresssing", len, err);
-	return NULL;
-}
-
-/* Once we've assembled */
-static bool encode_short_channel_ids_end(u8 **encoded, size_t max_bytes)
-{
-	u8 *z;
-
-	/* First byte says what encoding we want. */
-	switch ((enum scid_encode_types)(*encoded)[0]) {
-	case SHORTIDS_ZLIB:
-		/* compress */
-		z = zencode_scids(tmpctx, *encoded + 1, tal_count(*encoded) - 1);
-		if (z) {
-			/* If successful, copy over and trimp */
-			tal_resize(encoded, 1 + tal_count(z));
-			memcpy((*encoded) + 1, z, tal_count(z));
-			goto check_length;
-		}
-		/* Otherwise, change first byte to 'uncompressed' */
-		(*encoded)[0] = SHORTIDS_UNCOMPRESSED;
-		/* Fall thru */
-	case SHORTIDS_UNCOMPRESSED:
-		goto check_length;
+	/* Note: validity of node_id is already checked. */
+	na_tlvs = tlv_node_ann_tlvs_new(ctx);
+	if (!fromwire_node_announcement(ctx, msg,
+					&signature, features,
+					&timestamp,
+					&id, rgb_color, alias,
+					&addresses,
+					na_tlvs)) {
+		status_broken("Bad local node_announcement @%u: %s",
+			      n->bcast.index, tal_hex(tmpctx, msg));
+		return false;
 	}
 
-	status_failed(STATUS_FAIL_INTERNAL_ERROR,
-		      "Unknown short_ids encoding %u", (*encoded)[0]);
-
-check_length:
-#if DEVELOPER
-	if (tal_count(*encoded) > max_scids_encode_bytes)
+	if (!node_id_eq(&id, &n->id) || timestamp != n->bcast.timestamp) {
+		status_broken("Wrong node_announcement @%u:"
+			      " expected %s timestamp %u "
+			      " got %s timestamp %u",
+			      n->bcast.index,
+			      type_to_string(tmpctx, struct node_id, &n->id),
+			      timestamp,
+			      type_to_string(tmpctx, struct node_id, &id),
+			      n->bcast.timestamp);
 		return false;
-#endif
-	return tal_count(*encoded) <= max_bytes;
-}
-
-/* BOLT #7:
- *
- * A node:
- *   - if the `gossip_queries` feature is negotiated:
- * 	- MUST NOT relay any gossip messages unless explicitly requested.
- */
-static void setup_gossip_range(struct peer *peer)
-{
-	u8 *msg;
-
-	/*~ Without the `gossip_queries` feature, gossip flows automatically. */
-	if (!peer->gossip_queries_feature)
-		return;
-
-	/*~ We need to ask for something to start the gossip flowing: we ask
-	 * for everything from 1970 to 2106; this is horribly naive.  We
-	 * should be much smarter about requesting only what we don't already
-	 * have. */
-	msg = towire_gossip_timestamp_filter(peer,
-					     &peer->daemon->chain_hash,
-					     0, UINT32_MAX);
-	queue_peer_msg(peer, take(msg));
-}
-
-/* Create a node_announcement with the given signature. It may be NULL in the
- * case we need to create a provisional announcement for the HSM to sign.
- * This is called twice: once with the dummy signature to get it signed and a
- * second time to build the full packet with the signature. The timestamp is
- * handed in rather than using time_now() internally, since that could change
- * between the dummy creation and the call with a signature. */
-static u8 *create_node_announcement(const tal_t *ctx, struct daemon *daemon,
-				    secp256k1_ecdsa_signature *sig,
-				    u32 timestamp)
-{
-	u8 *addresses = tal_arr(tmpctx, u8, 0);
-	u8 *announcement;
-	size_t i;
-	if (!sig) {
-		sig = tal(tmpctx, secp256k1_ecdsa_signature);
-		memset(sig, 0, sizeof(*sig));
 	}
-	for (i = 0; i < tal_count(daemon->announcable); i++)
-		towire_wireaddr(&addresses, &daemon->announcable[i]);
 
-	announcement =
-	    towire_node_announcement(ctx, sig, daemon->globalfeatures, timestamp,
-				     &daemon->id, daemon->rgb, daemon->alias,
-				     addresses);
-	return announcement;
-}
+	*wireaddrs = fromwire_wireaddr_array(ctx, addresses);
+	*rates = tal_steal(ctx, na_tlvs->option_will_fund);
 
-/*~ This routine created a `node_announcement` for our node, and hands it to
- * the routing.c code like any other `node_announcement`.  Such announcements
- * are only accepted if there is an announced channel associated with that node
- * (to prevent spam), so we only call this once we've announced a channel. */
-static void send_node_announcement(struct daemon *daemon)
-{
-	u32 timestamp = time_now().ts.tv_sec;
-	secp256k1_ecdsa_signature sig;
-	u8 *msg, *nannounce, *err;
-	s64 last_timestamp;
-	struct node *self = get_node(daemon->rstate, &daemon->id);
-
-	/* BOLT #7:
-	 *
-	 * The origin node:
-	 *   - MUST set `timestamp` to be greater than that of any previous
-	 *   `node_announcement` it has previously created.
-	 */
-	if (self)
-		last_timestamp = self->last_timestamp;
-	else
-		/* last_timestamp is carefully a s64, so this works */
-		last_timestamp = -1;
-
-	if (timestamp <= last_timestamp)
-		timestamp = last_timestamp + 1;
-
-	/* Get an unsigned one. */
-	nannounce = create_node_announcement(tmpctx, daemon, NULL, timestamp);
-
-	/* Ask hsmd to sign it (synchronous) */
-	if (!wire_sync_write(HSM_FD, take(towire_hsm_node_announcement_sig_req(NULL, nannounce))))
-		status_failed(STATUS_FAIL_MASTER_IO, "Could not write to HSM: %s", strerror(errno));
-
-	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!fromwire_hsm_node_announcement_sig_reply(msg, &sig))
-		status_failed(STATUS_FAIL_MASTER_IO, "HSM returned an invalid node_announcement sig");
-
-	/* We got the signature for out provisional node_announcement back
-	 * from the HSM, create the real announcement and forward it to
-	 * gossipd so it can take care of forwarding it. */
-	nannounce = create_node_announcement(NULL, daemon, &sig, timestamp);
-
-	/* This injects it into the routing code in routing.c; it should not
-	 * reject it! */
-	err = handle_node_announcement(daemon->rstate, take(nannounce));
-	if (err)
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "rejected own node announcement: %s",
-			      tal_hex(tmpctx, err));
-}
-
-/* Return true if the only change would be the timestamp. */
-static bool node_announcement_redundant(struct daemon *daemon)
-{
-	struct node *n = get_node(daemon->rstate, &daemon->id);
-	if (!n)
-		return false;
-
-	if (n->last_timestamp == -1)
-		return false;
-
-	if (tal_count(n->addresses) != tal_count(daemon->announcable))
-		return false;
-
-	for (size_t i = 0; i < tal_count(n->addresses); i++)
-		if (!wireaddr_eq(&n->addresses[i], &daemon->announcable[i]))
-			return false;
-
-	BUILD_ASSERT(ARRAY_SIZE(daemon->alias) == ARRAY_SIZE(n->alias));
-	if (!memeq(daemon->alias, ARRAY_SIZE(daemon->alias),
-		   n->alias, ARRAY_SIZE(n->alias)))
-		return false;
-
-	BUILD_ASSERT(ARRAY_SIZE(daemon->rgb) == ARRAY_SIZE(n->rgb_color));
-	if (!memeq(daemon->rgb, ARRAY_SIZE(daemon->rgb),
-		   n->rgb_color, ARRAY_SIZE(n->rgb_color)))
-		return false;
-
-	if (!memeq(daemon->globalfeatures, tal_count(daemon->globalfeatures),
-		   n->globalfeatures, tal_count(n->globalfeatures)))
-		return false;
-
+	tal_free(addresses);
 	return true;
 }
 
-/* Should we announce our own node?  Called at strategic places. */
-static void maybe_send_own_node_announce(struct daemon *daemon)
+/* Version which also does nodeid lookup */
+static bool get_node_announcement_by_id(const tal_t *ctx,
+					struct daemon *daemon,
+					const struct node_id *node_id,
+					u8 rgb_color[3],
+					u8 alias[32],
+					u8 **features,
+					struct wireaddr **wireaddrs,
+					struct lease_rates **rates)
 {
-	/* We keep an internal flag in the routing code to say we've announced
-	 * a local channel.  The alternative would be to have it make a
-	 * callback, but when we start up we don't want to make multiple
-	 * announcments, so we use this approach for now. */
-	if (!daemon->rstate->local_channel_announced)
-		return;
+	struct node *n = get_node(daemon->rstate, node_id);
+	if (!n)
+		return false;
 
-	if (node_announcement_redundant(daemon))
-		return;
-
-	send_node_announcement(daemon);
-	daemon->rstate->local_channel_announced = false;
+	return get_node_announcement(ctx, daemon, n, rgb_color, alias,
+				     features, wireaddrs, rates);
 }
 
 /*~Routines to handle gossip messages from peer, forwarded by subdaemons.
@@ -495,1048 +217,267 @@ static void maybe_send_own_node_announce(struct daemon *daemon)
  * message, and puts the announcemnt on an internal 'pending'
  * queue.  We'll send a request to lightningd to look it up, and continue
  * processing in `handle_txout_reply`. */
-static const u8 *handle_channel_announcement_msg(struct peer *peer,
+static const u8 *handle_channel_announcement_msg(struct daemon *daemon,
+						 struct peer *peer,
 						 const u8 *msg)
 {
 	const struct short_channel_id *scid;
 	const u8 *err;
 
-	/* If it's OK, tells us the short_channel_id to lookup */
-	err = handle_channel_announcement(peer->daemon->rstate, msg, &scid);
+	/* If it's OK, tells us the short_channel_id to lookup; it notes
+	 * if this is the unknown channel the peer was looking for (in
+	 * which case, it frees and NULLs that ptr) */
+	err = handle_channel_announcement(daemon->rstate, msg,
+					  daemon->current_blockheight,
+					  &scid, peer);
 	if (err)
 		return err;
-	else if (scid)
-		daemon_conn_send(peer->daemon->master,
-				 take(towire_gossip_get_txout(NULL, scid)));
+	else if (scid) {
+		/* We give them some grace period, in case we don't know about
+		 * block yet. */
+		if (daemon->current_blockheight == 0
+		    || !is_scid_depth_announceable(scid,
+						   daemon->current_blockheight)) {
+			tal_arr_expand(&daemon->deferred_txouts, *scid);
+		} else {
+			daemon_conn_send(daemon->master,
+					 take(towire_gossipd_get_txout(NULL,
+								      scid)));
+		}
+	}
 	return NULL;
 }
 
 static u8 *handle_channel_update_msg(struct peer *peer, const u8 *msg)
 {
+	struct short_channel_id unknown_scid;
 	/* Hand the channel_update to the routing code */
-	u8 *err = handle_channel_update(peer->daemon->rstate, msg, "subdaemon");
+	u8 *err;
+
+	unknown_scid.u64 = 0;
+	err = handle_channel_update(peer->daemon->rstate, msg, peer,
+				    &unknown_scid, false);
 	if (err)
 		return err;
 
-	/*~ As a nasty compromise in the spec, we only forward channel_announce
-	 * once we have a channel_update; the channel isn't *usable* for
+	/* If it's an unknown channel, ask someone about it */
+	if (unknown_scid.u64 != 0)
+		query_unknown_channel(peer->daemon, peer, &unknown_scid);
+
+	/*~ As a nasty compromise in the spec, we only forward `channel_announce`
+	 * once we have a `channel_update`; the channel isn't *usable* for
 	 * routing until you have both anyway.  For this reason, we might have
 	 * just sent out our own channel_announce, so we check if it's time to
 	 * send a node_announcement too. */
-	maybe_send_own_node_announce(peer->daemon);
+	maybe_send_own_node_announce(peer->daemon, false);
 	return NULL;
 }
 
-/*~ The peer can ask about an array of short channel ids: we don't assemble the
- * reply immediately but process them one at a time in dump_gossip which is
- * called when there's nothing more important to send. */
-static const u8 *handle_query_short_channel_ids(struct peer *peer, const u8 *msg)
+static u8 *handle_node_announce(struct peer *peer, const u8 *msg)
 {
-	struct bitcoin_blkid chain;
-	u8 *encoded;
-	struct short_channel_id *scids;
+	bool was_unknown = false;
+	u8 *err;
 
-	if (!fromwire_query_short_channel_ids(tmpctx, msg, &chain, &encoded)) {
-		return towire_errorfmt(peer, NULL,
-				       "Bad query_short_channel_ids %s",
-				       tal_hex(tmpctx, msg));
-	}
-
-	if (!bitcoin_blkid_eq(&peer->daemon->chain_hash, &chain)) {
-		status_trace("%s sent query_short_channel_ids chainhash %s",
-			     type_to_string(tmpctx, struct pubkey, &peer->id),
-			     type_to_string(tmpctx, struct bitcoin_blkid, &chain));
-		return NULL;
-	}
-
-	/* BOLT #7:
-	 *
-	 * - if it has not sent `reply_short_channel_ids_end` to a
-	 *   previously received `query_short_channel_ids` from this
-         *   sender:
-	 *    - MAY fail the connection.
-	 */
-	if (peer->scid_queries || peer->scid_query_nodes) {
-		return towire_errorfmt(peer, NULL,
-				       "Bad concurrent query_short_channel_ids");
-	}
-
-	scids = decode_short_ids(tmpctx, encoded);
-	if (!scids) {
-		return towire_errorfmt(peer, NULL,
-				       "Bad query_short_channel_ids encoding %s",
-				       tal_hex(tmpctx, encoded));
-	}
-
-	/* BOLT #7:
-	 *
-	 * - MUST respond to each known `short_channel_id` with a `channel_announcement`
-	 *   and the latest `channel_update` for each end
-	 *    - SHOULD NOT wait for the next outgoing gossip flush to send
-	 *      these.
-	 */
-	peer->scid_queries = tal_steal(peer, scids);
-	peer->scid_query_idx = 0;
-	peer->scid_query_nodes = tal_arr(peer, struct pubkey, 0);
-
-	/* Notify the daemon_conn-write loop to invoke create_next_scid_reply */
-	daemon_conn_wake(peer->dc);
-	return NULL;
+	err = handle_node_announcement(peer->daemon->rstate, msg, peer,
+				       &was_unknown);
+	if (was_unknown)
+		query_unknown_node(peer->daemon->seeker, peer);
+	return err;
 }
 
-/*~ The peer can specify a timestamp range; gossip outside this range won't be
- * sent any more, and we'll start streaming gossip in this range.  This is
- * only supposed to be used if we negotiate the `gossip_queries` in which case
- * the first send triggers the first gossip to be sent.
-*/
-static u8 *handle_gossip_timestamp_filter(struct peer *peer, const u8 *msg)
+static void handle_local_channel_announcement(struct daemon *daemon, const u8 *msg)
 {
-	struct bitcoin_blkid chain_hash;
-	u32 first_timestamp, timestamp_range;
-
-	if (!fromwire_gossip_timestamp_filter(msg, &chain_hash,
-					      &first_timestamp,
-					      &timestamp_range)) {
-		return towire_errorfmt(peer, NULL,
-				       "Bad gossip_timestamp_filter %s",
-				       tal_hex(tmpctx, msg));
-	}
-
-	if (!bitcoin_blkid_eq(&peer->daemon->chain_hash, &chain_hash)) {
-		status_trace("%s sent gossip_timestamp_filter chainhash %s",
-			     type_to_string(tmpctx, struct pubkey, &peer->id),
-			     type_to_string(tmpctx, struct bitcoin_blkid,
-					    &chain_hash));
-		return NULL;
-	}
-
-	/* We initialize the timestamps to "impossible" values so we can
-	 * detect that this is the first filter: in this case, we gossip sync
-	 * immediately. */
-	if (peer->gossip_timestamp_min > peer->gossip_timestamp_max)
-		wake_gossip_out(peer);
-
-	/* FIXME: We don't index by timestamp, so this forces a brute
-	 * search!  But keeping in correct order is v. hard. */
-	peer->gossip_timestamp_min = first_timestamp;
-	peer->gossip_timestamp_max = first_timestamp + timestamp_range - 1;
-	/* In case they overflow. */
-	if (peer->gossip_timestamp_max < peer->gossip_timestamp_min)
-		peer->gossip_timestamp_max = UINT32_MAX;
-	peer->broadcast_index = 0;
-	return NULL;
-}
-
-/*~ We can send multiple replies when the peer queries for all channels in
- * a given range of blocks; each one indicates the range of blocks it covers. */
-static void reply_channel_range(struct peer *peer,
-				u32 first_blocknum, u32 number_of_blocks,
-				const u8 *encoded)
-{
-	/* BOLT #7:
-	 *
-	 * - For each `reply_channel_range`:
-	 *   - MUST set with `chain_hash` equal to that of `query_channel_range`,
-	 *   - MUST encode a `short_channel_id` for every open channel it
-	 *     knows in blocks `first_blocknum` to `first_blocknum` plus
-	 *     `number_of_blocks` minus one.
-	 *   - MUST limit `number_of_blocks` to the maximum number of blocks
-         *     whose results could fit in `encoded_short_ids`
-	 *   - if does not maintain up-to-date channel information for
-	 *     `chain_hash`:
-	 *     - MUST set `complete` to 0.
-	 *   - otherwise:
-	 *     - SHOULD set `complete` to 1.
-	 */
-	u8 *msg = towire_reply_channel_range(NULL,
-					     &peer->daemon->chain_hash,
-					     first_blocknum,
-					     number_of_blocks,
-					     1, encoded);
-	queue_peer_msg(peer, take(msg));
-}
-
-/*~ When we need to send an array of channels, it might go over our 64k packet
- * size.  If it doesn't, we recurse, splitting in two, etc.  Each message
- * indicates what blocks it contains, so the recipient knows when we're
- * finished.
- *
- * tail_blocks is the empty blocks at the end, in case they asked for all
- * blocks to 4 billion.
- */
-static bool queue_channel_ranges(struct peer *peer,
-				 u32 first_blocknum, u32 number_of_blocks,
-				 u32 tail_blocks)
-{
-	struct routing_state *rstate = peer->daemon->rstate;
-	u8 *encoded = encode_short_channel_ids_start(tmpctx);
-	struct short_channel_id scid;
-	bool scid_ok;
-
-	/* BOLT #7:
-	 *
-	 * 1. type: 264 (`reply_channel_range`) (`gossip_queries`)
-	 * 2. data:
-	 *   * [`32`:`chain_hash`]
-	 *   * [`4`:`first_blocknum`]
-	 *   * [`4`:`number_of_blocks`]
-	 *   * [`1`:`complete`]
-	 *   * [`2`:`len`]
-	 *   * [`len`:`encoded_short_ids`]
-	 */
-	const size_t reply_overhead = 32 + 4 + 4 + 1 + 2;
-	const size_t max_encoded_bytes = 65535 - 2 - reply_overhead;
-
-	/* Avoid underflow: we don't use block 0 anyway */
-	if (first_blocknum == 0)
-		scid_ok = mk_short_channel_id(&scid, 1, 0, 0);
-	else
-		scid_ok = mk_short_channel_id(&scid, first_blocknum, 0, 0);
-	scid.u64--;
-	if (!scid_ok)
-		return false;
-
-	/* We keep a `uintmap` of `short_channel_id` to `struct chan *`.
-	 * Unlike a htable, it's efficient to iterate through, but it only
-	 * works because each short_channel_id is basically a 64-bit unsigned
-	 * integer.
-	 *
-	 * First we iteraate and gather all the short channel ids. */
-	while (uintmap_after(&rstate->chanmap, &scid.u64)) {
-		u32 blocknum = short_channel_id_blocknum(&scid);
-		if (blocknum >= first_blocknum + number_of_blocks)
-			break;
-
-		encode_add_short_channel_id(&encoded, &scid);
-	}
-
-	/* If we can encode that, fine: send it */
-	if (encode_short_channel_ids_end(&encoded, max_encoded_bytes)) {
-		reply_channel_range(peer, first_blocknum,
-				    number_of_blocks + tail_blocks,
-				    encoded);
-		return true;
-	}
-
-	/* It wouldn't all fit: divide in half */
-	/* We assume we can always send one block! */
-	if (number_of_blocks <= 1) {
-		/* We always assume we can send 1 blocks worth */
-		status_broken("Could not fit scids for single block %u",
-			      first_blocknum);
-		return false;
-	}
-	status_debug("queue_channel_ranges full: splitting %u+%u and %u+%u(+%u)",
-		     first_blocknum,
-		     number_of_blocks / 2,
-		     first_blocknum + number_of_blocks / 2,
-		     number_of_blocks - number_of_blocks / 2,
-		     tail_blocks);
-	return queue_channel_ranges(peer, first_blocknum, number_of_blocks / 2, 0)
-		&& queue_channel_ranges(peer, first_blocknum + number_of_blocks / 2,
-					number_of_blocks - number_of_blocks / 2,
-					tail_blocks);
-}
-
-/*~ The peer can ask for all channels is a series of blocks.  We reply with one
- * or more messages containing the short_channel_ids. */
-static u8 *handle_query_channel_range(struct peer *peer, const u8 *msg)
-{
-	struct routing_state *rstate = peer->daemon->rstate;
-	struct bitcoin_blkid chain_hash;
-	u32 first_blocknum, number_of_blocks, tail_blocks;
-	struct short_channel_id last_scid;
-
-	if (!fromwire_query_channel_range(msg, &chain_hash,
-					  &first_blocknum, &number_of_blocks)) {
-		return towire_errorfmt(peer, NULL,
-				       "Bad query_channel_range %s",
-				       tal_hex(tmpctx, msg));
-	}
-
-	/* FIXME: if they ask for the wrong chain, we should not ignore it,
-	 * but give an empty response with the `complete` flag unset? */
-	if (!bitcoin_blkid_eq(&peer->daemon->chain_hash, &chain_hash)) {
-		status_trace("%s sent query_channel_range chainhash %s",
-			     type_to_string(tmpctx, struct pubkey, &peer->id),
-			     type_to_string(tmpctx, struct bitcoin_blkid,
-					    &chain_hash));
-		return NULL;
-	}
-
-	/* If they ask for number_of_blocks UINTMAX, and we have to divide
-	 * and conquer, we'll do a lot of unnecessary work.  Cap it at the
-	 * last value we have, then send an empty reply. */
-	if (uintmap_last(&rstate->chanmap, &last_scid.u64)) {
-		u32 last_block = short_channel_id_blocknum(&last_scid);
-
-		/* u64 here avoids overflow on number_of_blocks
-		   UINTMAX for example */
-		if ((u64)first_blocknum + number_of_blocks > last_block) {
-			tail_blocks = first_blocknum + number_of_blocks
-				- last_block - 1;
-			number_of_blocks -= tail_blocks;
-		} else
-			tail_blocks = 0;
-	} else
-		tail_blocks = 0;
-
-	if (!queue_channel_ranges(peer, first_blocknum, number_of_blocks,
-				  tail_blocks))
-		return towire_errorfmt(peer, NULL,
-				       "Invalid query_channel_range %u+%u",
-				       first_blocknum, number_of_blocks + tail_blocks);
-
-	return NULL;
-}
-
-/*~ This is the reply we get when we send query_channel_range; we keep
- * expecting them until the entire range we asked for is covered. */
-static const u8 *handle_reply_channel_range(struct peer *peer, const u8 *msg)
-{
-	struct bitcoin_blkid chain;
-	u8 complete;
-	u32 first_blocknum, number_of_blocks, start, end;
-	u8 *encoded;
-	struct short_channel_id *scids;
-	size_t n;
-	unsigned long b;
-
-	if (!fromwire_reply_channel_range(tmpctx, msg, &chain, &first_blocknum,
-					  &number_of_blocks, &complete,
-					  &encoded)) {
-		return towire_errorfmt(peer, NULL,
-				       "Bad reply_channel_range %s",
-				       tal_hex(tmpctx, msg));
-	}
-
-	if (!bitcoin_blkid_eq(&peer->daemon->chain_hash, &chain)) {
-		return towire_errorfmt(peer, NULL,
-				       "reply_channel_range for bad chain: %s",
-				       tal_hex(tmpctx, msg));
-	}
-
-	if (!peer->query_channel_blocks) {
-		return towire_errorfmt(peer, NULL,
-				       "reply_channel_range without query: %s",
-				       tal_hex(tmpctx, msg));
-	}
-
-	/* Beware overflow! */
-	if (first_blocknum + number_of_blocks < first_blocknum) {
-		return towire_errorfmt(peer, NULL,
-				       "reply_channel_range invalid %u+%u",
-				       first_blocknum, number_of_blocks);
-	}
-
-	scids = decode_short_ids(tmpctx, encoded);
-	if (!scids) {
-		return towire_errorfmt(peer, NULL,
-				       "Bad reply_channel_range encoding %s",
-				       tal_hex(tmpctx, encoded));
-	}
-
-	status_debug("peer %s reply_channel_range %u+%u (of %u+%u) %zu scids",
-		     type_to_string(tmpctx, struct pubkey, &peer->id),
-		     first_blocknum, number_of_blocks,
-		     peer->range_first_blocknum,
-		     peer->range_end_blocknum - peer->range_first_blocknum,
-		     tal_count(scids));
-
-	/* BOLT #7:
-	 *
-	 * The receiver of `query_channel_range`:
-	 *...
-	 *  - MUST respond with one or more `reply_channel_range` whose
-	 *    combined range cover the requested `first_blocknum` to
-	 *    `first_blocknum` plus `number_of_blocks` minus one.
-	 */
-	/* ie. They can be outside range we asked, but they must overlap! */
-	if (first_blocknum + number_of_blocks <= peer->range_first_blocknum
-	    || first_blocknum >= peer->range_end_blocknum) {
-		return towire_errorfmt(peer, NULL,
-				       "reply_channel_range invalid %u+%u for query %u+%u",
-				       first_blocknum, number_of_blocks,
-				       peer->range_first_blocknum,
-				       peer->range_end_blocknum
-				       - peer->range_first_blocknum);
-	}
-
-	start = first_blocknum;
-	end = first_blocknum + number_of_blocks;
-	/* Trim to make it a subset of what we want. */
-	if (start < peer->range_first_blocknum)
-		start = peer->range_first_blocknum;
-	if (end > peer->range_end_blocknum)
-		end = peer->range_end_blocknum;
-
-	/* We keep a bitmap of what blocks have been covered by replies: bit 0
-	 * represents block peer->range_first_blocknum */
-	b = bitmap_ffs(peer->query_channel_blocks,
-		       start - peer->range_first_blocknum,
-		       end - peer->range_first_blocknum);
-	if (b != end - peer->range_first_blocknum) {
-		return towire_errorfmt(peer, NULL,
-				       "reply_channel_range %u+%u already have block %lu",
-				       first_blocknum, number_of_blocks,
-				       peer->range_first_blocknum + b);
-	}
-
-	/* Mark that short_channel_ids for this block have been received */
-	bitmap_fill_range(peer->query_channel_blocks,
-			  start - peer->range_first_blocknum,
-			  end - peer->range_first_blocknum);
-	peer->range_blocks_remaining -= end - start;
-
-	/* Add scids */
-	n = tal_count(peer->query_channel_scids);
-	tal_resize(&peer->query_channel_scids, n + tal_count(scids));
-	memcpy(peer->query_channel_scids + n, scids, tal_bytelen(scids));
-
-	/* Still more to go? */
-	if (peer->range_blocks_remaining)
-		return NULL;
-
-	/* All done, send reply to lightningd: that's currently the only thing
-	 * which triggers this (for testing).  Eventually we might start probing
-	 * for gossip information on our own. */
-	msg = towire_gossip_query_channel_range_reply(NULL,
-						      first_blocknum,
-						      number_of_blocks,
-						      complete,
-						      peer->query_channel_scids);
-	daemon_conn_send(peer->daemon->master, take(msg));
-	peer->query_channel_scids = tal_free(peer->query_channel_scids);
-	peer->query_channel_blocks = tal_free(peer->query_channel_blocks);
-	return NULL;
-}
-
-/*~ For simplicity, all pings and pongs are forwarded to us here in gossipd. */
-static u8 *handle_ping(struct peer *peer, const u8 *ping)
-{
-	u8 *pong;
-
-	/* This checks the ping packet and makes a pong reply if needed; peer
-	 * can specify it doesn't want a response, to simulate traffic. */
-	if (!check_ping_make_pong(NULL, ping, &pong))
-		return towire_errorfmt(peer, NULL, "Bad ping");
-
-	if (pong)
-		queue_peer_msg(peer, take(pong));
-	return NULL;
-}
-
-/*~ When we get a pong, we tell lightningd about it (it's probably a response
- * to the `ping` JSON RPC command). */
-static const u8 *handle_pong(struct peer *peer, const u8 *pong)
-{
-	const char *err = got_pong(pong, &peer->num_pings_outstanding);
-
-	if (err)
-		return towire_errorfmt(peer, NULL, "%s", err);
-
-	daemon_conn_send(peer->daemon->master,
-			 take(towire_gossip_ping_reply(NULL, &peer->id, true,
-						       tal_count(pong))));
-	return NULL;
-}
-
-/*~ When we ask about an array of short_channel_ids, we get all channel &
- * node announcements and channel updates which the peer knows.  There's an
- * explicit end packet; this is needed to differentiate between 'I'm slow'
- * and 'I don't know those channels'. */
-static u8 *handle_reply_short_channel_ids_end(struct peer *peer, const u8 *msg)
-{
-	struct bitcoin_blkid chain;
-	u8 complete;
-
-	if (!fromwire_reply_short_channel_ids_end(msg, &chain, &complete)) {
-		return towire_errorfmt(peer, NULL,
-				       "Bad reply_short_channel_ids_end %s",
-				       tal_hex(tmpctx, msg));
-	}
-
-	if (!bitcoin_blkid_eq(&peer->daemon->chain_hash, &chain)) {
-		return towire_errorfmt(peer, NULL,
-				       "reply_short_channel_ids_end for bad chain: %s",
-				       tal_hex(tmpctx, msg));
-	}
-
-	if (peer->num_scid_queries_outstanding == 0) {
-		return towire_errorfmt(peer, NULL,
-				       "unexpected reply_short_channel_ids_end: %s",
-				       tal_hex(tmpctx, msg));
-	}
-
-	peer->num_scid_queries_outstanding--;
-	/* We tell lightningd: this is because we currently only ask for
-	 * query_short_channel_ids when lightningd asks. */
-	msg = towire_gossip_scids_reply(msg, true, complete);
-	daemon_conn_send(peer->daemon->master, take(msg));
-	return NULL;
-}
-
-/*~ Arbitrary ordering function of pubkeys.
- *
- * Note that we could use memcmp() here: even if they had somehow different
- * bitwise representations for the same key, we copied them all from struct
- * node which should make them unique.  Even if not (say, a node vanished
- * and reappeared) we'd just end up sending two node_announcement for the
- * same node.
- */
-static int pubkey_order(const struct pubkey *k1, const struct pubkey *k2,
-			void *unused UNUSED)
-{
-	return pubkey_cmp(k1, k2);
-}
-
-static void uniquify_node_ids(struct pubkey **ids)
-{
-	size_t dst, src;
-
-	/* BOLT #7:
-	 *
-	 * - MUST follow with any `node_announcement`s for each
-	 *   `channel_announcement`
-	 *
-	 *   - SHOULD avoid sending duplicate `node_announcements` in
-	 *     response to a single `query_short_channel_ids`.
-	 */
-	/* ccan/asort is a typesafe qsort wrapper: like most ccan modules
-	 * it eschews exposing 'void *' pointers and ensures that the
-	 * callback function and its arguments match types correctly. */
-	asort(*ids, tal_count(*ids), pubkey_order, NULL);
-
-	/* Compact the array */
-	for (dst = 0, src = 0; src < tal_count(*ids); src++) {
-		if (dst && pubkey_eq(&(*ids)[dst-1], &(*ids)[src]))
-			continue;
-		(*ids)[dst++] = (*ids)[src];
-	}
-
-	/* And trim to length, so tal_count() gives correct answer. */
-	tal_resize(ids, dst);
-}
-
-/*~ We are fairly careful to avoid the peer DoSing us with channel queries:
- * this routine sends information about a single short_channel_id, unless
- * it's finished all of them. */
-static void maybe_create_next_scid_reply(struct peer *peer)
-{
-	struct routing_state *rstate = peer->daemon->rstate;
-	size_t i, num;
-	bool sent = false;
-
-	/* BOLT #7:
-	 *
-	 *   - MUST respond to each known `short_channel_id` with a
-	 *     `channel_announcement` and the latest `channel_update` for each end
-	 *     - SHOULD NOT wait for the next outgoing gossip flush
-	 *       to send these.
-	 */
-	/* Search for next short_channel_id we know about. */
-	num = tal_count(peer->scid_queries);
-	for (i = peer->scid_query_idx; !sent && i < num; i++) {
-		struct chan *chan;
-
-		chan = get_channel(rstate, &peer->scid_queries[i]);
-		if (!chan || !is_chan_announced(chan))
-			continue;
-
-		queue_peer_msg(peer, chan->channel_announce);
-		if (chan->half[0].channel_update)
-			queue_peer_msg(peer, chan->half[0].channel_update);
-		if (chan->half[1].channel_update)
-			queue_peer_msg(peer, chan->half[1].channel_update);
-
-		/* Record node ids for later transmission of node_announcement */
-		tal_arr_expand(&peer->scid_query_nodes, chan->nodes[0]->id);
-		tal_arr_expand(&peer->scid_query_nodes, chan->nodes[1]->id);
-		sent = true;
-	}
-
-	/* Just finished channels?  Remove duplicate nodes. */
-	if (peer->scid_query_idx != num && i == num)
-		uniquify_node_ids(&peer->scid_query_nodes);
-
-	/* Update index for next time we're called. */
-	peer->scid_query_idx = i;
-
-	/* BOLT #7:
-	 *
-	 *  - MUST follow with any `node_announcement`s for each
-	 *   `channel_announcement`
-	 *    - SHOULD avoid sending duplicate `node_announcements` in response
-	 *     to a single `query_short_channel_ids`.
-	 */
-	/* If we haven't sent anything above, we look for the next
-	 * node_announcement to send. */
-	num = tal_count(peer->scid_query_nodes);
-	for (i = peer->scid_query_nodes_idx; !sent && i < num; i++) {
-		const struct node *n;
-
-		/* Not every node announces itself (we know it exists because
-		 * of a channel_announcement, however) */
-		n = get_node(rstate, &peer->scid_query_nodes[i]);
-		if (!n || !n->node_announcement_index)
-			continue;
-
-		queue_peer_msg(peer, n->node_announcement);
-		sent = true;
-	}
-	peer->scid_query_nodes_idx = i;
-
-	/* All finished? */
-	if (peer->scid_queries && peer->scid_query_nodes_idx == num) {
-		/* BOLT #7:
-		 *
-		 * - MUST follow these responses with
-		 *   `reply_short_channel_ids_end`.
-		 *   - if does not maintain up-to-date channel information for
-		 *     `chain_hash`:
-		 *      - MUST set `complete` to 0.
-		 *   - otherwise:
-		 *      - SHOULD set `complete` to 1.
-		 */
-		/* FIXME: We consider ourselves to have complete knowledge. */
-		u8 *end = towire_reply_short_channel_ids_end(peer,
-							     &peer->daemon->chain_hash,
-							     true);
-		queue_peer_msg(peer, take(end));
-
-		/* We're done!  Clean up so we simply pass-through next time. */
-		peer->scid_queries = tal_free(peer->scid_queries);
-		peer->scid_query_idx = 0;
-		peer->scid_query_nodes = tal_free(peer->scid_query_nodes);
-		peer->scid_query_nodes_idx = 0;
-	}
-}
-
-/*~ If we're supposed to be sending gossip, do so now. */
-static void maybe_queue_gossip(struct peer *peer)
-{
-	const u8 *next;
-
-	/* If the gossip timer is still running, don't send. */
-	if (peer->gossip_timer)
-		return;
-
-#if DEVELOPER
-	/* The dev_suppress_gossip RPC is used for testing. */
-	if (suppress_gossip)
-		return;
-#endif
-
-	/*~ We maintain an ordered map of gossip to broadcast, so each peer
-	 * only needs to keep an index; this returns the next gossip message
-	 * which is past the previous index and within the timestamp: it
-	 * also updates `broadcast_index`. */
-	next = next_broadcast(peer->daemon->rstate->broadcasts,
-			      peer->gossip_timestamp_min,
-			      peer->gossip_timestamp_max,
-			      &peer->broadcast_index);
-
-	if (next) {
-		queue_peer_msg(peer, next);
-		return;
-	}
-
-	/* BOLT #7:
-	 *
-	 * A node:
-	 *...
-	 *  - SHOULD flush outgoing gossip messages once every 60 seconds,
-	 *    independently of the arrival times of the messages.
-	 *    - Note: this results in staggered announcements that are unique
-	 *      (not duplicated).
-	 */
-
-	/* Gossip is drained; we set up timer now, which is strictly-speaking
-	 * more than 60 seconds if sending gossip took a long time.  But
-	 * that's their fault for being slow! */
-	peer->gossip_timer
-		= new_reltimer(&peer->daemon->timers, peer,
-			       /* The time is adjustable for testing */
-			       time_from_msec(peer->daemon->broadcast_interval_msec),
-			       wake_gossip_out, peer);
-}
-
-/*~ This is called when the outgoing queue is empty; gossip has lower priority
- * than just about anything else. */
-static void dump_gossip(struct peer *peer)
-{
-	/* Do we have scid query replies to send? */
-	maybe_create_next_scid_reply(peer);
-
-	/* Queue any gossip we want to send */
-	maybe_queue_gossip(peer);
-}
-
-/*~ This generates a `channel_update` message for one of our channels.  We do
- * this here, rather than in `channeld` because we (may) need to do it
- * ourselves anyway if channeld dies, or when we refresh it once a week. */
-static void update_local_channel(struct daemon *daemon,
-				 const struct chan *chan,
-				 int direction,
-				 bool disable,
-				 u16 cltv_expiry_delta,
-				 u64 htlc_minimum_msat,
-				 u32 fee_base_msat,
-				 u32 fee_proportional_millionths,
-				 u64 htlc_maximum_msat,
-				 const char *caller)
-{
-	secp256k1_ecdsa_signature dummy_sig;
-	u8 *update, *msg;
-	u32 timestamp = time_now().ts.tv_sec;
-	u8 message_flags, channel_flags;
-
-	/* So valgrind doesn't complain */
-	memset(&dummy_sig, 0, sizeof(dummy_sig));
-
-	/* BOLT #7:
-	 *
-	 * The origin node:
-	 *...
-	 *   - MUST set `timestamp` to greater than 0, AND to greater than any
-	 *     previously-sent `channel_update` for this `short_channel_id`.
-	 *     - SHOULD base `timestamp` on a UNIX timestamp.
-	 */
-	if (is_halfchan_defined(&chan->half[direction])
-	    && timestamp == chan->half[direction].last_timestamp)
-		timestamp++;
-
-	/* BOLT #7:
-	 *
-	 * The `channel_flags` bitfield is used to indicate the direction of
-	 * the channel: it identifies the node that this update originated
-	 * from and signals various options concerning the channel. The
-	 * following table specifies the meaning of its individual bits:
-	 *
-	 * | Bit Position  | Name        | Meaning                          |
-	 * | ------------- | ----------- | -------------------------------- |
-	 * | 0             | `direction` | Direction this update refers to. |
-	 * | 1             | `disable`   | Disable the channel.             |
-	 */
-	channel_flags = direction;
-	if (disable)
-		channel_flags |= ROUTING_FLAGS_DISABLED;
-
-	/* BOLT #7:
-	 *
-	 * The `message_flags` bitfield is used to indicate the presence of
-	 * optional fields in the `channel_update` message:
-	 *
-	 *| Bit Position  | Name                      | Field                 |
-	 *...
-	 *| 0             | `option_channel_htlc_max` | `htlc_maximum_msat`   |
-	 */
-	message_flags = 0 | ROUTING_OPT_HTLC_MAX_MSAT;
-
-	/* We create an update with a dummy signature, and hand to hsmd to get
-	 * it signed. */
-	update = towire_channel_update_option_channel_htlc_max(tmpctx, &dummy_sig,
-				       &daemon->chain_hash,
-				       &chan->scid,
-				       timestamp,
-				       message_flags, channel_flags,
-				       cltv_expiry_delta,
-				       htlc_minimum_msat,
-				       fee_base_msat,
-				       fee_proportional_millionths,
-				       htlc_maximum_msat);
-
-	/* Note that we treat the hsmd as synchronous.  This is simple (no
-	 * callback hell)!, but may need to change to async if we ever want
-	 * remote HSMs */
-	if (!wire_sync_write(HSM_FD,
-			     towire_hsm_cupdate_sig_req(tmpctx, update))) {
-		status_failed(STATUS_FAIL_HSM_IO, "Writing cupdate_sig_req: %s",
-			      strerror(errno));
-	}
-
-	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!msg || !fromwire_hsm_cupdate_sig_reply(NULL, msg, &update)) {
-		status_failed(STATUS_FAIL_HSM_IO,
-			      "Reading cupdate_sig_req: %s",
-			      strerror(errno));
-	}
-
-	/* BOLT #7:
-	 *
-	 * The origin node:
-	 *  - MAY create a `channel_update` to communicate the channel parameters to the
-	 *    channel peer, even though the channel has not yet been announced (i.e. the
-	 *    `announce_channel` bit was not set).
-	 */
-	if (!is_chan_public(chan)) {
-		/* handle_channel_update will not put private updates in the
-		 * broadcast list, but we send it direct to the peer (if we
-		 * have one connected) now */
-		struct peer *peer = find_peer(daemon,
-					      &chan->nodes[!direction]->id);
-		if (peer)
-			queue_peer_msg(peer, update);
-	}
-
-	/* We feed it into routing.c like any other channel_update; it may
-	 * discard it (eg. non-public channel), but it should not complain
-	 * about it being invalid! */
-	msg = handle_channel_update(daemon->rstate, take(update), caller);
-	if (msg)
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "%s: rejected local channel update %s: %s",
-			      caller,
-			      /* Normally we must not touch something taken()
-			       * but we're in deep trouble anyway, and
-			       * handle_channel_update only tal_steals onto
-			       * tmpctx, so it's actually OK. */
-			      tal_hex(tmpctx, update),
-			      tal_hex(tmpctx, msg));
-}
-
-/*~ We generate local channel updates lazily; most of the time we simply
- * toggle the `local_disabled` flag so we don't use it to route.  We never
- * change anything else after startup (yet!) */
-static void maybe_update_local_channel(struct daemon *daemon,
-				       struct chan *chan, int direction)
-{
-	const struct half_chan *hc = &chan->half[direction];
-
-	/* Don't generate a channel_update for an uninitialized channel. */
-	if (!hc->channel_update)
-		return;
-
-	/* Nothing to update? */
-	/*~ Note the inversions here on both sides, which is cheap conversion to
-	 * boolean for the RHS! */
-	if (!chan->local_disabled == !(hc->channel_flags & ROUTING_FLAGS_DISABLED))
-		return;
-
-	update_local_channel(daemon, chan, direction,
-			     chan->local_disabled,
-			     hc->delay,
-			     hc->htlc_minimum_msat,
-			     hc->base_fee,
-			     hc->proportional_fee,
-			     hc->htlc_maximum_msat,
-			     /* Note this magic C macro which expands to the
-			      * function name, for debug messages */
-			     __func__);
-}
-
-/*~ This helper figures out which direction of the channel is from-us; if
- * neither, it returns false.  This meets Linus' rule "Always return the error",
- * without doing some horrible 0/1/-1 return. */
-static bool local_direction(struct daemon *daemon,
-			    const struct chan *chan,
-			    int *direction)
-{
-	for (*direction = 0; *direction < 2; (*direction)++) {
-		if (pubkey_eq(&chan->nodes[*direction]->id, &daemon->id))
-			return true;
-	}
-	return false;
-}
-
-/*~ This is when channeld asks us for a channel_update for a local channel.
- * It does that to fill in the error field when lightningd fails an HTLC and
- * sets the UPDATE bit in the error type.  lightningd is too important to
- * fetch this itself, so channeld does it (channeld has to talk to us for
- * other things anyway, so why not?). */
-static bool handle_get_update(struct peer *peer, const u8 *msg)
-{
-	struct short_channel_id scid;
-	struct chan *chan;
-	const u8 *update;
-	struct routing_state *rstate = peer->daemon->rstate;
-	int direction;
-
-	if (!fromwire_gossipd_get_update(msg, &scid)) {
-		status_broken("peer %s sent bad gossip_get_update %s",
-			      type_to_string(tmpctx, struct pubkey, &peer->id),
-			      tal_hex(tmpctx, msg));
-		return false;
-	}
-
-	/* It's possible that the channel has just closed (though v. unlikely) */
-	chan = get_channel(rstate, &scid);
-	if (!chan) {
-		status_unusual("peer %s scid %s: unknown channel",
-			       type_to_string(tmpctx, struct pubkey, &peer->id),
-			       type_to_string(tmpctx, struct short_channel_id,
-					      &scid));
-		update = NULL;
-		goto out;
-	}
-
-	/* We want the update that comes from our end. */
-	if (!local_direction(peer->daemon, chan, &direction)) {
-		status_unusual("peer %s scid %s: not our channel?",
-			       type_to_string(tmpctx, struct pubkey, &peer->id),
-			       type_to_string(tmpctx,
-					      struct short_channel_id,
-					      &scid));
-		update = NULL;
-		goto out;
-	}
-
-	/* Since we're going to send it out, make sure it's up-to-date. */
-	maybe_update_local_channel(peer->daemon, chan, direction);
-
-	/* It's possible this is NULL, if we've never sent a channel_update
-	 * for that channel. */
-	update = chan->half[direction].channel_update;
-out:
-	status_trace("peer %s schanid %s: %s update",
-		     type_to_string(tmpctx, struct pubkey, &peer->id),
-		     type_to_string(tmpctx, struct short_channel_id, &scid),
-		     update ? "got" : "no");
-
-	msg = towire_gossipd_get_update_reply(NULL, update);
-	daemon_conn_send(peer->dc, take(msg));
-	return true;
-}
-
-/*~ Return true if the channel information has changed.  This can only
-* currently happen if the user restarts with different fee options, but we
-* don't assume that. */
-static bool halfchan_new_info(const struct half_chan *hc,
-			      u16 cltv_delta, u64 htlc_minimum_msat,
-			      u32 fee_base_msat, u32 fee_proportional_millionths,
-			      u64 htlc_maximum_msat)
-{
-	if (!is_halfchan_defined(hc))
-		return true;
-
-	return hc->delay != cltv_delta
-		|| hc->htlc_minimum_msat != htlc_minimum_msat
-		|| hc->base_fee != fee_base_msat
-		|| hc->proportional_fee != fee_proportional_millionths
-		|| hc->htlc_maximum_msat != htlc_maximum_msat;
-}
-
-/*~ channeld asks us to update the local channel. */
-static bool handle_local_channel_update(struct peer *peer, const u8 *msg)
-{
-	struct chan *chan;
-	struct short_channel_id scid;
-	bool disable;
-	u16 cltv_expiry_delta;
-	u64 htlc_minimum_msat;
-	u64 htlc_maximum_msat;
-	u32 fee_base_msat;
-	u32 fee_proportional_millionths;
-	int direction;
-
-	/* FIXME: We should get scid from lightningd when setting up the
-	 * connection, so no per-peer daemon can mess with channels other than
-	 * its own! */
-	if (!fromwire_gossipd_local_channel_update(msg,
-						   &scid,
-						   &disable,
-						   &cltv_expiry_delta,
-						   &htlc_minimum_msat,
-						   &fee_base_msat,
-						   &fee_proportional_millionths,
-						   &htlc_maximum_msat)) {
-		status_broken("peer %s bad local_channel_update %s",
-			      type_to_string(tmpctx, struct pubkey, &peer->id),
-			      tal_hex(tmpctx, msg));
-		return false;
-	}
-
-	/* Can theoretically happen if channel just closed. */
-	chan = get_channel(peer->daemon->rstate, &scid);
-	if (!chan) {
-		status_trace("peer %s local_channel_update for unknown %s",
-			      type_to_string(tmpctx, struct pubkey, &peer->id),
-			      type_to_string(tmpctx, struct short_channel_id,
-					     &scid));
-		return true;
-	}
-
-	/* You shouldn't be asking for a non-local channel though. */
-	if (!local_direction(peer->daemon, chan, &direction)) {
-		status_broken("peer %s bad local_channel_update for non-local %s",
-			      type_to_string(tmpctx, struct pubkey, &peer->id),
-			      type_to_string(tmpctx, struct short_channel_id,
-					     &scid));
-		return false;
-	}
-
-	/* We could change configuration on restart; update immediately.
-	 * Or, if we're *enabling* an announced-disabled channel.
-	 * Or, if it's an unannounced channel (only sending to peer). */
-	if (halfchan_new_info(&chan->half[direction],
-			      cltv_expiry_delta, htlc_minimum_msat,
-			      fee_base_msat, fee_proportional_millionths,
-			      htlc_maximum_msat)
-	    || ((chan->half[direction].channel_flags & ROUTING_FLAGS_DISABLED)
-		&& !disable)
-	    || !is_chan_public(chan)) {
-		update_local_channel(peer->daemon, chan, direction,
-				     disable,
-				     cltv_expiry_delta,
-				     htlc_minimum_msat,
-				     fee_base_msat,
-				     fee_proportional_millionths,
-				     htlc_maximum_msat,
-				     __func__);
-	}
-
-	/* Normal case: just toggle local_disabled, and generate broadcast in
-	 * maybe_update_local_channel when/if someone asks about it. */
-	chan->local_disabled = disable;
-	return true;
-}
-
-/*~ This is where the per-peer daemons send us messages.  It's either forwarded
- * gossip, or a request for information.  We deliberately use non-overlapping
- * message types so we can distinguish them. */
-static struct io_plan *peer_msg_in(struct io_conn *conn,
-				    const u8 *msg,
-				    struct peer *peer)
-{
+	u8 *cannouncement;
 	const u8 *err;
-	bool ok;
+	struct node_id id;
+	struct peer *peer;
+
+	if (!fromwire_gossipd_local_channel_announcement(msg, msg,
+							 &id,
+							 &cannouncement))
+		master_badmsg(WIRE_GOSSIPD_LOCAL_CHANNEL_ANNOUNCEMENT, msg);
+
+	/* We treat it OK even if peer has disconnected since (unlikely though!) */
+	peer = find_peer(daemon, &id);
+	if (!peer)
+		status_broken("Unknown peer %s for local_channel_announcement",
+			      type_to_string(tmpctx, struct node_id, &id));
+
+	err = handle_channel_announcement_msg(daemon, peer, cannouncement);
+	if (err) {
+		status_broken("peer %s invalid local_channel_announcement %s (%s)",
+			      type_to_string(tmpctx, struct node_id, &id),
+			      tal_hex(tmpctx, msg),
+			      tal_hex(tmpctx, err));
+	}
+}
+
+
+/* channeld (via lightningd) tells us about (as-yet?) unannounce channel.
+ * It needs us to put it in gossip_store. */
+static void handle_local_private_channel(struct daemon *daemon, const u8 *msg)
+{
+	struct node_id id;
+	struct amount_sat capacity;
+	u8 *features;
+	struct short_channel_id scid;
+	const u8 *cannounce;
+
+	if (!fromwire_gossipd_local_private_channel(msg, msg,
+						    &id, &capacity, &scid,
+						    &features))
+		master_badmsg(WIRE_GOSSIPD_LOCAL_PRIVATE_CHANNEL, msg);
+
+	cannounce = private_channel_announcement(tmpctx,
+						 &scid,
+						 &daemon->id,
+						 &id,
+						 features);
+
+	if (!routing_add_private_channel(daemon->rstate, &id, capacity,
+					 cannounce, 0)) {
+		status_peer_broken(&id, "bad add_private_channel %s",
+				   tal_hex(tmpctx, cannounce));
+	}
+}
+
+/*~ This is where connectd tells us about a new peer we might want to
+ *  gossip with. */
+static void connectd_new_peer(struct daemon *daemon, const u8 *msg)
+{
+	struct peer *peer = tal(daemon, struct peer);
+	struct node *node;
+
+	if (!fromwire_gossipd_new_peer(msg, &peer->id,
+				      &peer->gossip_queries_feature)) {
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Bad new_peer msg from connectd: %s",
+			      tal_hex(tmpctx, msg));
+	}
+
+	if (find_peer(daemon, &peer->id)) {
+		status_broken("Peer %s already here?",
+			      type_to_string(tmpctx, struct node_id, &peer->id));
+		tal_free(find_peer(daemon, &peer->id));
+	}
+
+	/* Populate the rest of the peer info. */
+	peer->daemon = daemon;
+	peer->gossip_counter = 0;
+	peer->scid_queries = NULL;
+	peer->scid_query_idx = 0;
+	peer->scid_query_nodes = NULL;
+	peer->scid_query_nodes_idx = 0;
+	peer->scid_query_outstanding = false;
+	peer->range_replies = NULL;
+	peer->query_channel_range_cb = NULL;
+
+	/* We keep a list so we can find peer by id */
+	list_add_tail(&peer->daemon->peers, &peer->list);
+	tal_add_destructor(peer, destroy_peer);
+
+	node = get_node(daemon->rstate, &peer->id);
+	if (node)
+		peer_enable_channels(daemon, node);
+
+	/* This sends the initial timestamp filter. */
+	seeker_setup_peer_gossip(daemon->seeker, peer);
+}
+
+static void connectd_peer_gone(struct daemon *daemon, const u8 *msg)
+{
+	struct node_id id;
+	struct peer *peer;
+
+	if (!fromwire_gossipd_peer_gone(msg, &id)) {
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Bad peer_gone msg from connectd: %s",
+			      tal_hex(tmpctx, msg));
+	}
+
+	peer = find_peer(daemon, &id);
+	if (!peer)
+		status_broken("Peer %s already gone?",
+			      type_to_string(tmpctx, struct node_id, &id));
+	tal_free(peer);
+}
+
+/*~ lightningd asks us if we know any addresses for a given id. */
+static struct io_plan *handle_get_address(struct io_conn *conn,
+					  struct daemon *daemon,
+					  const u8 *msg)
+{
+	struct node_id id;
+	u8 rgb_color[3];
+	u8 alias[32];
+	u8 *features;
+	struct wireaddr *addrs;
+	struct lease_rates *rates;
+
+	if (!fromwire_gossipd_get_addrs(msg, &id))
+		master_badmsg(WIRE_GOSSIPD_GET_ADDRS, msg);
+
+	if (!get_node_announcement_by_id(tmpctx, daemon, &id,
+					 rgb_color, alias, &features, &addrs,
+					 &rates))
+		addrs = NULL;
+
+	daemon_conn_send(daemon->master,
+			 take(towire_gossipd_get_addrs_reply(NULL, addrs)));
+	return daemon_conn_read_next(conn, daemon->master);
+}
+
+static void handle_recv_gossip(struct daemon *daemon, const u8 *outermsg)
+{
+	struct node_id id;
+	u8 *msg;
+	const u8 *err;
+	struct peer *peer;
+
+	if (!fromwire_gossipd_recv_gossip(outermsg, outermsg, &id, &msg)) {
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Bad gossipd_recv_gossip msg from connectd: %s",
+			      tal_hex(tmpctx, outermsg));
+	}
+
+	peer = find_peer(daemon, &id);
+	if (!peer) {
+		status_broken("connectd sent gossip msg %s from unknown peer %s",
+			      peer_wire_name(fromwire_peektype(msg)),
+			      type_to_string(tmpctx, struct node_id, &id));
+		return;
+	}
 
 	/* These are messages relayed from peer */
-	switch ((enum wire_type)fromwire_peektype(msg)) {
+	switch ((enum peer_wire)fromwire_peektype(msg)) {
 	case WIRE_CHANNEL_ANNOUNCEMENT:
-		err = handle_channel_announcement_msg(peer, msg);
-		goto handled_relay;
+		err = handle_channel_announcement_msg(peer->daemon, peer, msg);
+		goto handled_msg;
 	case WIRE_CHANNEL_UPDATE:
 		err = handle_channel_update_msg(peer, msg);
-		goto handled_relay;
+		goto handled_msg;
 	case WIRE_NODE_ANNOUNCEMENT:
-		err = handle_node_announcement(peer->daemon->rstate, msg);
-		goto handled_relay;
+		err = handle_node_announce(peer, msg);
+		goto handled_msg;
 	case WIRE_QUERY_CHANNEL_RANGE:
 		err = handle_query_channel_range(peer, msg);
-		goto handled_relay;
+		goto handled_msg;
 	case WIRE_REPLY_CHANNEL_RANGE:
 		err = handle_reply_channel_range(peer, msg);
-		goto handled_relay;
+		goto handled_msg;
 	case WIRE_QUERY_SHORT_CHANNEL_IDS:
 		err = handle_query_short_channel_ids(peer, msg);
-		goto handled_relay;
+		goto handled_msg;
 	case WIRE_REPLY_SHORT_CHANNEL_IDS_END:
 		err = handle_reply_short_channel_ids_end(peer, msg);
-		goto handled_relay;
-	case WIRE_GOSSIP_TIMESTAMP_FILTER:
-		err = handle_gossip_timestamp_filter(peer, msg);
-		goto handled_relay;
-	case WIRE_PING:
-		err = handle_ping(peer, msg);
-		goto handled_relay;
-	case WIRE_PONG:
-		err = handle_pong(peer, msg);
-		goto handled_relay;
+		goto handled_msg;
 
 	/* These are non-gossip messages (!is_msg_for_gossipd()) */
+	case WIRE_WARNING:
 	case WIRE_INIT:
 	case WIRE_ERROR:
+	case WIRE_PING:
+	case WIRE_PONG:
 	case WIRE_OPEN_CHANNEL:
 	case WIRE_ACCEPT_CHANNEL:
 	case WIRE_FUNDING_CREATED:
@@ -1551,177 +492,36 @@ static struct io_plan *peer_msg_in(struct io_conn *conn,
 	case WIRE_COMMITMENT_SIGNED:
 	case WIRE_REVOKE_AND_ACK:
 	case WIRE_UPDATE_FEE:
+	case WIRE_UPDATE_BLOCKHEIGHT:
 	case WIRE_CHANNEL_REESTABLISH:
 	case WIRE_ANNOUNCEMENT_SIGNATURES:
-		status_broken("peer %s: relayed unexpected msg of type %s",
-			      type_to_string(tmpctx, struct pubkey, &peer->id),
-			      wire_type_name(fromwire_peektype(msg)));
-		return io_close(conn);
-	}
-
-	/* Must be a gossip_peerd_wire_type asking us to do something. */
-	switch ((enum gossip_peerd_wire_type)fromwire_peektype(msg)) {
-	case WIRE_GOSSIPD_GET_UPDATE:
-		ok = handle_get_update(peer, msg);
-		goto handled_cmd;
-	case WIRE_GOSSIPD_LOCAL_ADD_CHANNEL:
-		ok = handle_local_add_channel(peer->daemon->rstate, msg);
-		if (ok)
-			gossip_store_add(peer->daemon->rstate->store, msg);
-		goto handled_cmd;
-	case WIRE_GOSSIPD_LOCAL_CHANNEL_UPDATE:
-		ok = handle_local_channel_update(peer, msg);
-		goto handled_cmd;
-
-	/* These are the ones we send, not them */
-	case WIRE_GOSSIPD_GET_UPDATE_REPLY:
-	case WIRE_GOSSIPD_SEND_GOSSIP:
+	case WIRE_GOSSIP_TIMESTAMP_FILTER:
+	case WIRE_TX_ADD_INPUT:
+	case WIRE_TX_REMOVE_INPUT:
+	case WIRE_TX_ADD_OUTPUT:
+	case WIRE_TX_REMOVE_OUTPUT:
+	case WIRE_TX_COMPLETE:
+	case WIRE_TX_SIGNATURES:
+	case WIRE_OPEN_CHANNEL2:
+	case WIRE_ACCEPT_CHANNEL2:
+	case WIRE_INIT_RBF:
+	case WIRE_ACK_RBF:
+	case WIRE_OBS2_ONION_MESSAGE:
+	case WIRE_ONION_MESSAGE:
+#if EXPERIMENTAL_FEATURES
+	case WIRE_STFU:
+#endif
 		break;
 	}
 
-	/* Anything else should not have been sent to us: close on it */
-	status_broken("peer %s: unexpected cmd of type %i %s",
-		      type_to_string(tmpctx, struct pubkey, &peer->id),
-		      fromwire_peektype(msg),
-		      gossip_peerd_wire_type_name(fromwire_peektype(msg)));
-	return io_close(conn);
+	status_failed(STATUS_FAIL_INTERNAL_ERROR,
+		      "connectd sent unexpected gossip msg %s for peer %s",
+		      peer_wire_name(fromwire_peektype(msg)),
+		      type_to_string(tmpctx, struct node_id, &peer->id));
 
-	/* Commands should always be OK. */
-handled_cmd:
-	if (!ok)
-		return io_close(conn);
-	goto done;
-
-	/* Forwarded messages may be bad, so we have error which the per-peer
-	 * daemon will forward to the peer. */
-handled_relay:
+handled_msg:
 	if (err)
 		queue_peer_msg(peer, take(err));
-done:
-	return daemon_conn_read_next(conn, peer->dc);
-}
-
-/*~ This is where connectd tells us about a new peer, and we hand back an fd for
- * it to send us messages via peer_msg_in above */
-static struct io_plan *connectd_new_peer(struct io_conn *conn,
-					 struct daemon *daemon,
-					 const u8 *msg)
-{
-	struct peer *peer = tal(conn, struct peer);
-	int fds[2];
-
-	if (!fromwire_gossip_new_peer(msg, &peer->id,
-				      &peer->gossip_queries_feature,
-				      &peer->initial_routing_sync_feature)) {
-		status_broken("Bad new_peer msg from connectd: %s",
-			      tal_hex(tmpctx, msg));
-		return io_close(conn);
-	}
-
-	/* This can happen: we handle it gracefully, returning a `failed` msg. */
-	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0) {
-		status_broken("Failed to create socketpair: %s",
-			      strerror(errno));
-		daemon_conn_send(daemon->connectd,
-				 take(towire_gossip_new_peer_reply(NULL, false)));
-		goto done;
-	}
-
-	/* We might not have noticed old peer is dead; kill it now. */
-	tal_free(find_peer(daemon, &peer->id));
-
-	/* Populate the rest of the peer info. */
-	peer->daemon = daemon;
-	peer->scid_queries = NULL;
-	peer->scid_query_idx = 0;
-	peer->scid_query_nodes = NULL;
-	peer->scid_query_nodes_idx = 0;
-	peer->num_scid_queries_outstanding = 0;
-	peer->query_channel_blocks = NULL;
-	peer->num_pings_outstanding = 0;
-	peer->gossip_timer = NULL;
-
-	/* We keep a list so we can find peer by id */
-	list_add_tail(&peer->daemon->peers, &peer->list);
-	tal_add_destructor(peer, destroy_peer);
-
-	/* BOLT #7:
-	 *
-	 *   - if the `gossip_queries` feature is negotiated:
-	 *	- MUST NOT relay any gossip messages unless explicitly requested.
-	 */
-	if (peer->gossip_queries_feature) {
-		peer->broadcast_index = UINT64_MAX;
-		/* Nothing in this "impossible" range */
-		peer->gossip_timestamp_min = UINT32_MAX;
-		peer->gossip_timestamp_max = 0;
-	} else {
-		/* BOLT #7:
-		 *
-		 * - upon receiving an `init` message with the
-		 *   `initial_routing_sync` flag set to 1:
-		 *   - SHOULD send gossip messages for all known channels and
-		 *    nodes, as if they were just received.
-		 * - if the `initial_routing_sync` flag is set to 0, OR if the
-		 *   initial sync was completed:
-		 *   - SHOULD resume normal operation, as specified in the
-		 *     following [Rebroadcasting](#rebroadcasting) section.
-		 */
-		peer->gossip_timestamp_min = 0;
-		peer->gossip_timestamp_max = UINT32_MAX;
-		if (peer->initial_routing_sync_feature)
-			peer->broadcast_index = 0;
-		else
-			peer->broadcast_index
-				= peer->daemon->rstate->broadcasts->next_index;
-	}
-
-	/* This is the new connection: calls dump_gossip when nothing else to
-	 * send. */
-	peer->dc = daemon_conn_new(daemon, fds[0],
-				   peer_msg_in, dump_gossip, peer);
-	/* Free peer if conn closed (destroy_peer closes conn if peer freed) */
-	tal_steal(peer->dc, peer);
-
-	/* This sends the initial timestamp filter. */
-	setup_gossip_range(peer);
-
-	/* Start the gossip flowing. */
-	wake_gossip_out(peer);
-
-	/* Reply with success, and the new fd */
-	daemon_conn_send(daemon->connectd,
-			 take(towire_gossip_new_peer_reply(NULL, true)));
-	daemon_conn_send_fd(daemon->connectd, fds[1]);
-
-done:
-	return daemon_conn_read_next(conn, daemon->connectd);
-}
-
-/*~ connectd can also ask us if we know any addresses for a given id. */
-static struct io_plan *connectd_get_address(struct io_conn *conn,
-					    struct daemon *daemon,
-					    const u8 *msg)
-{
-	struct pubkey id;
-	struct node *node;
-	const struct wireaddr *addrs;
-
-	if (!fromwire_gossip_get_addrs(msg, &id)) {
-		status_broken("Bad gossip_get_addrs msg from connectd: %s",
-			      tal_hex(tmpctx, msg));
-		return io_close(conn);
-	}
-
-	node = get_node(daemon->rstate, &id);
-	if (node)
-		addrs = node->addresses;
-	else
-		addrs = NULL;
-
-	daemon_conn_send(daemon->connectd,
-			 take(towire_gossip_get_addrs_reply(NULL, addrs)));
-	return daemon_conn_read_next(conn, daemon->connectd);
 }
 
 /*~ connectd's input handler is very simple. */
@@ -1729,69 +529,54 @@ static struct io_plan *connectd_req(struct io_conn *conn,
 				    const u8 *msg,
 				    struct daemon *daemon)
 {
-	enum connect_gossip_wire_type t = fromwire_peektype(msg);
+	enum connectd_gossipd_wire t = fromwire_peektype(msg);
 
 	switch (t) {
-	case WIRE_GOSSIP_NEW_PEER:
-		return connectd_new_peer(conn, daemon, msg);
+	case WIRE_GOSSIPD_RECV_GOSSIP:
+		handle_recv_gossip(daemon, msg);
+		goto handled;
 
-	case WIRE_GOSSIP_GET_ADDRS:
-		return connectd_get_address(conn, daemon, msg);
+	case WIRE_GOSSIPD_NEW_PEER:
+		connectd_new_peer(daemon, msg);
+		goto handled;
+
+	case WIRE_GOSSIPD_PEER_GONE:
+		connectd_peer_gone(daemon, msg);
+		goto handled;
 
 	/* We send these, don't receive them. */
-	case WIRE_GOSSIP_NEW_PEER_REPLY:
-	case WIRE_GOSSIP_GET_ADDRS_REPLY:
+	case WIRE_GOSSIPD_SEND_GOSSIP:
 		break;
 	}
 
-	status_broken("Bad msg from connectd: %s",
-		      tal_hex(tmpctx, msg));
-	return io_close(conn);
+	status_failed(STATUS_FAIL_INTERNAL_ERROR,
+		      "Bad msg from connectd2: %s", tal_hex(tmpctx, msg));
+
+handled:
+	return daemon_conn_read_next(conn, daemon->connectd);
 }
-
-/*~ This is our twice-weekly timer callback for refreshing our channels.  This
- * was added to the spec because people abandoned their channels without
- * closing them. */
-static void gossip_send_keepalive_update(struct daemon *daemon,
-					 const struct chan *chan,
-					 const struct half_chan *hc)
-{
-	status_trace("Sending keepalive channel_update for %s",
-		     type_to_string(tmpctx, struct short_channel_id,
-				    &chan->scid));
-
-	/* As a side-effect, this will create an update which matches the
-	 * local_disabled state */
-	update_local_channel(daemon, chan,
-			     hc->channel_flags & ROUTING_FLAGS_DIRECTION,
-			     chan->local_disabled,
-			     hc->delay,
-			     hc->htlc_minimum_msat,
-			     hc->base_fee,
-			     hc->proportional_fee,
-			     hc->htlc_maximum_msat,
-			     __func__);
-}
-
 
 /* BOLT #7:
  *
  * A node:
- *  - if a channel's latest `channel_update`s `timestamp` is older than two weeks
+ *  - if a channel's oldest `channel_update`s `timestamp` is older than two weeks
  *    (1209600 seconds):
  *     - MAY prune the channel.
  *     - MAY ignore the channel.
  */
 static void gossip_refresh_network(struct daemon *daemon)
 {
-	u64 now = time_now().ts.tv_sec;
-	/* Anything below this highwater mark could be pruned if not refreshed */
-	s64 highwater = now - daemon->rstate->prune_timeout / 2;
+	u64 now = gossip_time_now(daemon->rstate).ts.tv_sec;
+	s64 highwater;
 	struct node *n;
 
-	/* Schedule next run now (prune_timeout is 2 weeks) */
+	/* Send out 1 day before deadline */
+	highwater = now - (GOSSIP_PRUNE_INTERVAL(daemon->rstate->dev_fast_gossip)
+			   - GOSSIP_BEFORE_DEADLINE(daemon->rstate->dev_fast_gossip_prune));
+
+	/* Schedule next run now */
 	notleak(new_reltimer(&daemon->timers, daemon,
-			     time_from_sec(daemon->rstate->prune_timeout/4),
+			     time_from_sec(GOSSIP_PRUNE_INTERVAL(daemon->rstate->dev_fast_gossip_prune)/4),
 			     gossip_refresh_network, daemon));
 
 	/* Find myself in the network */
@@ -1799,8 +584,17 @@ static void gossip_refresh_network(struct daemon *daemon)
 	if (n) {
 		/* Iterate through all outgoing connection and check whether
 		 * it's time to re-announce */
-		for (size_t i = 0; i < tal_count(n->chans); i++) {
-			struct half_chan *hc = half_chan_from(n, n->chans[i]);
+		struct chan_map_iter i;
+		struct chan *c;
+
+		for (c = first_chan(n, &i); c; c = next_chan(n, &i)) {
+			struct half_chan *hc;
+			int direction;
+
+			if (!local_direction(daemon->rstate, c, &direction))
+				continue;
+
+			hc = &c->half[direction];
 
 			if (!is_halfchan_defined(hc)) {
 				/* Connection is not announced yet, so don't even
@@ -1808,17 +602,17 @@ static void gossip_refresh_network(struct daemon *daemon)
 				continue;
 			}
 
-			if (hc->last_timestamp > highwater) {
+			if (hc->bcast.timestamp > highwater) {
 				/* No need to send a keepalive update message */
 				continue;
 			}
 
-			if (!is_halfchan_enabled(hc)) {
-				/* Only send keepalives for active connections */
-				continue;
-			}
-
-			gossip_send_keepalive_update(daemon, n->chans[i], hc);
+			status_debug("Sending keepalive channel_update"
+				     " for %s/%u",
+				     type_to_string(tmpctx,
+						    struct short_channel_id,
+						    &c->scid), direction);
+			refresh_local_channel(daemon, c, direction);
 		}
 	}
 
@@ -1831,807 +625,286 @@ static void gossip_refresh_network(struct daemon *daemon)
 static void gossip_disable_local_channels(struct daemon *daemon)
 {
 	struct node *local_node = get_node(daemon->rstate, &daemon->id);
+	struct chan_map_iter i;
+	struct chan *c;
 
 	/* We don't have a local_node, so we don't have any channels yet
 	 * either */
 	if (!local_node)
 		return;
 
-	for (size_t i = 0; i < tal_count(local_node->chans); i++)
-		local_node->chans[i]->local_disabled = true;
+	for (c = first_chan(local_node, &i); c; c = next_chan(local_node, &i))
+		local_disable_chan(daemon, c, half_chan_idx(local_node, c));
+}
+
+struct peer *random_peer(struct daemon *daemon,
+			 bool (*check_peer)(const struct peer *peer))
+{
+	u64 target = UINT64_MAX;
+	struct peer *best = NULL, *i;
+
+	/* Reservoir sampling */
+	list_for_each(&daemon->peers, i, list) {
+		u64 r;
+
+		if (!check_peer(i))
+			continue;
+
+		r = pseudorand_u64();
+		if (r <= target) {
+			best = i;
+			target = r;
+		}
+	}
+	return best;
 }
 
 /*~ Parse init message from lightningd: starts the daemon properly. */
-static struct io_plan *gossip_init(struct io_conn *conn,
-				   struct daemon *daemon,
-				   const u8 *msg)
+static void gossip_init(struct daemon *daemon, const u8 *msg)
 {
-	u32 update_channel_interval;
+	u32 *dev_gossip_time;
+	bool dev_fast_gossip, dev_fast_gossip_prune;
+	u32 timestamp;
 
-	if (!fromwire_gossipctl_init(daemon, msg,
-				     /* 60,000 ms
-				      * (unless --dev-broadcast-interval) */
-				     &daemon->broadcast_interval_msec,
-				     &daemon->chain_hash,
-				     &daemon->id, &daemon->globalfeatures,
+	if (!fromwire_gossipd_init(daemon, msg,
+				     &chainparams,
+				     &daemon->our_features,
+				     &daemon->id,
 				     daemon->rgb,
 				     daemon->alias,
-				     /* 1 week in seconds
-				      * (unless --dev-channel-update-interval) */
-				     &update_channel_interval,
-				     &daemon->announcable)) {
-		master_badmsg(WIRE_GOSSIPCTL_INIT, msg);
+				     &daemon->announcable,
+				     &dev_gossip_time,
+				     &dev_fast_gossip,
+				     &dev_fast_gossip_prune)) {
+		master_badmsg(WIRE_GOSSIPD_INIT, msg);
 	}
 
-	/* Prune time (usually 2 weeks) is twice update time */
 	daemon->rstate = new_routing_state(daemon,
-					   chainparams_by_chainhash(&daemon->chain_hash),
 					   &daemon->id,
-					   update_channel_interval * 2);
+					   &daemon->peers,
+					   &daemon->timers,
+					   take(dev_gossip_time),
+					   dev_fast_gossip,
+					   dev_fast_gossip_prune);
 
-	/* Load stored gossip messages */
-	gossip_store_load(daemon->rstate, daemon->rstate->store);
+	/* Load stored gossip messages, get last modified time of file */
+	timestamp = gossip_store_load(daemon->rstate, daemon->rstate->gs);
+
+	/* If last_timestamp was > modified time of file, reduce it.
+	 * Usually it's capped to "now", but in the reload case it needs to
+	 * be the gossip_store mtime. */
+	if (daemon->rstate->last_timestamp > timestamp)
+		daemon->rstate->last_timestamp = timestamp;
 
 	/* Now disable all local channels, they can't be connected yet. */
 	gossip_disable_local_channels(daemon);
 
 	/* If that announced channels, we can announce ourselves (options
 	 * or addresses might have changed!) */
-	maybe_send_own_node_announce(daemon);
+	maybe_send_own_node_announce(daemon, true);
 
-	/* Start the weekly refresh timer. */
+	/* Start the twice- weekly refresh timer. */
 	notleak(new_reltimer(&daemon->timers, daemon,
-			     time_from_sec(daemon->rstate->prune_timeout/4),
+			     time_from_sec(GOSSIP_PRUNE_INTERVAL(daemon->rstate->dev_fast_gossip_prune) / 4),
 			     gossip_refresh_network, daemon));
 
-	return daemon_conn_read_next(conn, daemon->master);
+	/* Fire up the seeker! */
+	daemon->seeker = new_seeker(daemon);
+
+	/* connectd is already started, and uses this fd to feed/recv gossip. */
+	daemon->connectd = daemon_conn_new(daemon, CONNECTD_FD,
+					   connectd_req,
+					   maybe_send_query_responses, daemon);
+
+	/* OK, we are ready. */
+	daemon_conn_send(daemon->master,
+			 take(towire_gossipd_init_reply(NULL)));
 }
 
-/*~ lightningd can ask for a route between nodes. */
-static struct io_plan *getroute_req(struct io_conn *conn, struct daemon *daemon,
-				    const u8 *msg)
+static void new_blockheight(struct daemon *daemon, const u8 *msg)
 {
-	struct pubkey source, destination;
-	u64 msatoshi;
-	u32 final_cltv;
-	u64 riskfactor_by_million;
-	u32 max_hops;
-	u8 *out;
-	struct route_hop *hops;
-	double fuzz;
-	struct short_channel_id_dir *excluded;
+	if (!fromwire_gossipd_new_blockheight(msg, &daemon->current_blockheight))
+		master_badmsg(WIRE_GOSSIPD_NEW_BLOCKHEIGHT, msg);
 
-	/* To choose between variations, we need to know how much we're
-	 * sending (eliminates too-small channels, and also effects the fees
-	 * we'll pay), how to trade off more locktime vs. more fees, and how
-	 * much cltv we need a the final node to give exact values for each
-	 * intermediate hop, as well as how much random fuzz to inject to
-	 * avoid being too predictable. */
-	if (!fromwire_gossip_getroute_request(msg, msg,
-					      &source, &destination,
-					      &msatoshi, &riskfactor_by_million,
-					      &final_cltv, &fuzz,
-					      &excluded,
-					      &max_hops))
-		master_badmsg(WIRE_GOSSIP_GETROUTE_REQUEST, msg);
+	/* Check if we can now send any deferred queries. */
+	for (size_t i = 0; i < tal_count(daemon->deferred_txouts); i++) {
+		const struct short_channel_id *scid
+			= &daemon->deferred_txouts[i];
 
-	status_trace("Trying to find a route from %s to %s for %"PRIu64" msatoshi",
-		     pubkey_to_hexstr(tmpctx, &source),
-		     pubkey_to_hexstr(tmpctx, &destination), msatoshi);
-
-	/* routing.c does all the hard work; can return NULL. */
-	hops = get_route(tmpctx, daemon->rstate, &source, &destination,
-			 msatoshi, riskfactor_by_million / 1000000.0, final_cltv,
-			 fuzz, pseudorand_u64(), excluded, max_hops);
-
-	out = towire_gossip_getroute_reply(NULL, hops);
-	daemon_conn_send(daemon->master, take(out));
-	return daemon_conn_read_next(conn, daemon->master);
-}
-
-#define raw_pubkey(arr, id)				\
-	do { BUILD_ASSERT(sizeof(arr) == sizeof(*id));	\
-		memcpy(arr, id, sizeof(*id));		\
-	} while(0)
-
-/*~ When someone asks lightningd to `listchannels`, gossipd does the work:
- * marshalling the channel information for all channels into an array of
- * gossip_getchannels_entry, which lightningd converts to JSON.  Each channel
- * is represented by two half_chan; one in each direction.
- *
- * FIXME: I run a lightning node permanently under valgrind, and Christian ran
- * `listchannels` on it.  After about 15 minutes I simply rebooted.  There's
- * been some optimization since then, but blocking gossipd to marshall all the
- * channels will become in issue in future, I expect.  We may even hit the
- * 2^24 internal message limit.
- */
-static void append_half_channel(struct gossip_getchannels_entry **entries,
-				const struct chan *chan,
-				int idx)
-{
-	const struct half_chan *c = &chan->half[idx];
-	struct gossip_getchannels_entry e;
-
-	/* If we've never seen a channel_update for this direction... */
-	if (!is_halfchan_defined(c))
-		return;
-
-	/* Our 'struct chan' contains two nodes: they are in pubkey_cmp order
-	 * (ie. chan->nodes[0] is the lesser pubkey) and this is the same as
-	 * the direction bit in `channel_update`s `channel_flags`.
-	 *
-	 * The halfchans are arranged so that half[0] src == nodes[0], and we
-	 * use that here.  We also avoid using libsecp256k1 to translate the
-	 * pubkeys to DER and back: that proves quite expensive, and we assume
-	 * we're on the same architecture as lightningd, so we just send them
-	 * raw in this case. */
-	raw_pubkey(e.source, &chan->nodes[idx]->id);
-	raw_pubkey(e.destination, &chan->nodes[!idx]->id);
-	e.satoshis = chan->satoshis;
-	e.channel_flags = c->channel_flags;
-	e.message_flags = c->message_flags;
-	e.local_disabled = chan->local_disabled;
-	e.public = is_chan_public(chan);
-	e.short_channel_id = chan->scid;
-	e.last_update_timestamp = c->last_timestamp;
-	e.base_fee_msat = c->base_fee;
-	e.fee_per_millionth = c->proportional_fee;
-	e.delay = c->delay;
-
-	tal_arr_expand(entries, e);
-}
-
-/*~ Marshal (possibly) both channel directions into entries */
-static void append_channel(struct gossip_getchannels_entry **entries,
-			   const struct chan *chan)
-{
-	append_half_channel(entries, chan, 0);
-	append_half_channel(entries, chan, 1);
-}
-
-/*~ This is where lightningd asks for all channels we know about. */
-static struct io_plan *getchannels_req(struct io_conn *conn,
-				       struct daemon *daemon,
-				       const u8 *msg)
-{
-	u8 *out;
-	struct gossip_getchannels_entry *entries;
-	struct chan *chan;
-	struct short_channel_id *scid;
-	struct pubkey *source;
-
-	/* Note: scid is marked optional in gossip_wire.csv */
-	if (!fromwire_gossip_getchannels_request(msg, msg, &scid, &source))
-		master_badmsg(WIRE_GOSSIP_GETCHANNELS_REQUEST, msg);
-
-	entries = tal_arr(tmpctx, struct gossip_getchannels_entry, 0);
-	/* They can ask about a particular channel by short_channel_id */
-	if (scid) {
-		chan = get_channel(daemon->rstate, scid);
-		if (chan)
-			append_channel(&entries, chan);
-	} else if (source) {
-		struct node *s = get_node(daemon->rstate, source);
-		if (s) {
-			for (size_t i = 0; i < tal_count(s->chans); i++)
-				append_half_channel(&entries,
-						    s->chans[i],
-						    !half_chan_to(s,
-								  s->chans[i]));
-		}
-	} else {
-		u64 idx;
-
-		/* For the more general case, we just iterate through every
-		 * short channel id. */
-		for (chan = uintmap_first(&daemon->rstate->chanmap, &idx);
-		     chan;
-		     chan = uintmap_after(&daemon->rstate->chanmap, &idx)) {
-			append_channel(&entries, chan);
-		}
-	}
-
-	out = towire_gossip_getchannels_reply(NULL, entries);
-	daemon_conn_send(daemon->master, take(out));
-	return daemon_conn_read_next(conn, daemon->master);
-}
-
-/*~ Similarly, lightningd asks us for all nodes when it gets `listnodes` */
-/* We keep pointers into n, assuming it won't change. */
-static void append_node(const struct gossip_getnodes_entry ***entries,
-			const struct node *n)
-{
-	struct gossip_getnodes_entry *e;
-
-	e = tal(*entries, struct gossip_getnodes_entry);
-	raw_pubkey(e->nodeid, &n->id);
-	e->last_timestamp = n->last_timestamp;
-	/* Timestamp on wire is an unsigned 32 bit: we use a 64-bit signed, so
-	 * -1 means "we never received a channel_update". */
-	if (e->last_timestamp >= 0) {
-		e->globalfeatures = n->globalfeatures;
-		e->addresses = n->addresses;
-		BUILD_ASSERT(ARRAY_SIZE(e->alias) == ARRAY_SIZE(n->alias));
-		BUILD_ASSERT(ARRAY_SIZE(e->color) == ARRAY_SIZE(n->rgb_color));
-		memcpy(e->alias, n->alias, ARRAY_SIZE(e->alias));
-		memcpy(e->color, n->rgb_color, ARRAY_SIZE(e->color));
-	}
-
-	tal_arr_expand(entries, e);
-}
-
-/* Simply routine when they ask for `listnodes` */
-static struct io_plan *getnodes(struct io_conn *conn, struct daemon *daemon,
-				const u8 *msg)
-{
-	u8 *out;
-	struct node *n;
-	const struct gossip_getnodes_entry **nodes;
-	struct pubkey *id;
-
-	if (!fromwire_gossip_getnodes_request(tmpctx, msg, &id))
-		master_badmsg(WIRE_GOSSIP_GETNODES_REQUEST, msg);
-
-	/* Format of reply is the same whether they ask for a specific node
-	 * (0 or one responses) or all nodes (0 or more) */
-	nodes = tal_arr(tmpctx, const struct gossip_getnodes_entry *, 0);
-	if (id) {
-		n = get_node(daemon->rstate, id);
-		if (n)
-			append_node(&nodes, n);
-	} else {
-		struct node_map_iter i;
-		n = node_map_first(daemon->rstate->nodes, &i);
-		while (n != NULL) {
-			append_node(&nodes, n);
-			n = node_map_next(daemon->rstate->nodes, &i);
-		}
-	}
-	out = towire_gossip_getnodes_reply(NULL, nodes);
-	daemon_conn_send(daemon->master, take(out));
-	return daemon_conn_read_next(conn, daemon->master);
-}
-
-/*~ We currently have a JSON command to ping a peer: it ends up here, where
- * gossipd generates the actual ping and sends it like any other gossip. */
-static struct io_plan *ping_req(struct io_conn *conn, struct daemon *daemon,
-				const u8 *msg)
-{
-	struct pubkey id;
-	u16 num_pong_bytes, len;
-	struct peer *peer;
-	u8 *ping;
-
-	if (!fromwire_gossip_ping(msg, &id, &num_pong_bytes, &len))
-		master_badmsg(WIRE_GOSSIP_PING, msg);
-
-	/* Even if lightningd were to check for valid ids, there's a race
-	 * where it might vanish before we read this command; cleaner to
-	 * handle it here with 'sent' = false. */
-	peer = find_peer(daemon, &id);
-	if (!peer) {
-		daemon_conn_send(daemon->master,
-				 take(towire_gossip_ping_reply(NULL, &id,
-							       false, 0)));
-		goto out;
-	}
-
-	/* It should never ask for an oversize ping. */
-	ping = make_ping(peer, num_pong_bytes, len);
-	if (tal_count(ping) > 65535)
-		status_failed(STATUS_FAIL_MASTER_IO, "Oversize ping");
-
-	queue_peer_msg(peer, take(ping));
-	status_trace("sending ping expecting %sresponse",
-		     num_pong_bytes >= 65532 ? "no " : "");
-
-	/* BOLT #1:
-	 *
-	 * A node receiving a `ping` message:
-	 *...
-	 *  - if `num_pong_bytes` is less than 65532:
-	 *    - MUST respond by sending a `pong` message, with `byteslen` equal
-	 *      to `num_pong_bytes`.
-	 *  - otherwise (`num_pong_bytes` is **not** less than 65532):
-	 *    - MUST ignore the `ping`.
-	 */
-	if (num_pong_bytes >= 65532)
-		daemon_conn_send(daemon->master,
-				 take(towire_gossip_ping_reply(NULL, &id,
-							       true, 0)));
-	else
-		/* We'll respond to lightningd once the pong comes in */
-		peer->num_pings_outstanding++;
-
-out:
-	return daemon_conn_read_next(conn, daemon->master);
-}
-
-/*~ If a node has no public channels (other than the one to us), it's not
- * a very useful route to tell anyone about. */
-static bool node_has_public_channels(const struct node *peer,
-				     const struct chan *exclude)
-{
-	for (size_t i = 0; i < tal_count(peer->chans); i++) {
-		if (peer->chans[i] == exclude)
+		if (!is_scid_depth_announceable(scid,
+						daemon->current_blockheight))
 			continue;
-		if (is_chan_public(peer->chans[i]))
-			return true;
-	}
-	return false;
-}
 
-/*~ The `exposeprivate` flag is a trinary: NULL == dynamic, otherwise
- * value decides.  Thus, we provide two wrappers for clarity: */
-static bool never_expose(bool *exposeprivate)
-{
-	return exposeprivate && !*exposeprivate;
-}
+		/* short_channel_id is deep enough, now ask about it. */
+		daemon_conn_send(daemon->master,
+				 take(towire_gossipd_get_txout(NULL, scid)));
 
-static bool always_expose(bool *exposeprivate)
-{
-	return exposeprivate && *exposeprivate;
-}
-
-/*~ For routeboost, we offer payers a hint of what incoming channels might
- * have capacity for their payment.  To do this, lightningd asks for the
- * information about all channels to this node; but gossipd doesn't know about
- * current capacities, so lightningd selects which to use. */
-static struct io_plan *get_incoming_channels(struct io_conn *conn,
-					     struct daemon *daemon,
-					     const u8 *msg)
-{
-	struct node *node;
-	struct route_info *public = tal_arr(tmpctx, struct route_info, 0);
-	struct route_info *private = tal_arr(tmpctx, struct route_info, 0);
-	bool has_public;
-	bool *exposeprivate;
-
-	if (!fromwire_gossip_get_incoming_channels(tmpctx, msg, &exposeprivate))
-		master_badmsg(WIRE_GOSSIP_GET_INCOMING_CHANNELS, msg);
-
-	status_trace("exposeprivate = %s",
-		     exposeprivate ? (*exposeprivate ? "TRUE" : "FALSE") : "NULL");
-	status_trace("msg = %s", tal_hex(tmpctx, msg));
-	status_trace("always_expose = %u, never_expose = %u",
-		     always_expose(exposeprivate), never_expose(exposeprivate));
-
-	has_public = always_expose(exposeprivate);
-
-	node = get_node(daemon->rstate, &daemon->rstate->local_id);
-	if (node) {
-		for (size_t i = 0; i < tal_count(node->chans); i++) {
-			const struct chan *c = node->chans[i];
-			const struct half_chan *hc;
-			struct route_info ri;
-
-			hc = &c->half[half_chan_to(node, c)];
-
-			if (!is_halfchan_enabled(hc))
-				continue;
-
-			ri.pubkey = other_node(node, c)->id;
-			ri.short_channel_id = c->scid;
-			ri.fee_base_msat = hc->base_fee;
-			ri.fee_proportional_millionths = hc->proportional_fee;
-			ri.cltv_expiry_delta = hc->delay;
-
-			has_public |= is_chan_public(c);
-
-			/* If peer doesn't have other public channels,
-			 * no point giving route */
-			if (!node_has_public_channels(other_node(node, c), c))
-				continue;
-
-			if (always_expose(exposeprivate) || is_chan_public(c))
-				tal_arr_expand(&public, ri);
-			else
-				tal_arr_expand(&private, ri);
-		}
+		tal_arr_remove(&daemon->deferred_txouts, i);
+		i--;
 	}
 
-	/* If no public channels (even deadend ones!), share private ones. */
-	if (!has_public && !never_expose(exposeprivate))
-		msg = towire_gossip_get_incoming_channels_reply(NULL, private);
-	else
-		msg = towire_gossip_get_incoming_channels_reply(NULL, public);
-	daemon_conn_send(daemon->master, take(msg));
-
-	return daemon_conn_read_next(conn, daemon->master);
+	daemon_conn_send(daemon->master,
+			 take(towire_gossipd_new_blockheight_reply(NULL)));
 }
 
 #if DEVELOPER
-/* FIXME: One day this will be called internally; for now it's just for
- * testing with dev_query_scids. */
-static struct io_plan *query_scids_req(struct io_conn *conn,
-				       struct daemon *daemon,
-				       const u8 *msg)
-{
-	struct pubkey id;
-	struct short_channel_id *scids;
-	struct peer *peer;
-	u8 *encoded;
-	/* BOLT #7:
-	 *
-	 * 1. type: 261 (`query_short_channel_ids`) (`gossip_queries`)
-	 * 2. data:
-	 *     * [`32`:`chain_hash`]
-	 *     * [`2`:`len`]
-	 *     * [`len`:`encoded_short_ids`]
-	 */
-	const size_t reply_overhead = 32 + 2;
-	const size_t max_encoded_bytes = 65535 - 2 - reply_overhead;
-
-	if (!fromwire_gossip_query_scids(msg, msg, &id, &scids))
-		master_badmsg(WIRE_GOSSIP_QUERY_SCIDS, msg);
-
-	peer = find_peer(daemon, &id);
-	if (!peer) {
-		status_broken("query_scids: unknown peer %s",
-			      type_to_string(tmpctx, struct pubkey, &id));
-		goto fail;
-	}
-
-	if (!peer->gossip_queries_feature) {
-		status_broken("query_scids: no gossip_query support in peer %s",
-			      type_to_string(tmpctx, struct pubkey, &id));
-		goto fail;
-	}
-
-	encoded = encode_short_channel_ids_start(tmpctx);
-	for (size_t i = 0; i < tal_count(scids); i++)
-		encode_add_short_channel_id(&encoded, &scids[i]);
-
-	/* Because this is a dev command, we simply say this case is
-	 * "too hard". */
-	if (!encode_short_channel_ids_end(&encoded, max_encoded_bytes)) {
-		status_broken("query_short_channel_ids: %zu is too many",
-			      tal_count(scids));
-		goto fail;
-	}
-
-	msg = towire_query_short_channel_ids(NULL, &daemon->chain_hash,
-					     encoded);
-	queue_peer_msg(peer, take(msg));
-	peer->num_scid_queries_outstanding++;
-
-	status_trace("sending query for %zu scids", tal_count(scids));
-out:
-	return daemon_conn_read_next(conn, daemon->master);
-
-fail:
-	daemon_conn_send(daemon->master,
-			 take(towire_gossip_scids_reply(NULL, false, false)));
-	goto out;
-}
-
-/* BOLT #7:
- *
- * ### The `gossip_timestamp_filter` Message
- *...
- * This message allows a node to constrain future gossip messages to
- * a specific range.  A node which wants any gossip messages would have
- * to send this, otherwise `gossip_queries` negotiation means no gossip
- * messages would be received.
- *
- * Note that this filter replaces any previous one, so it can be used
- * multiple times to change the gossip from a peer. */
-/* This is the entry point for dev_send_timestamp_filter testing. */
-static struct io_plan *send_timestamp_filter(struct io_conn *conn,
-					     struct daemon *daemon,
-					     const u8 *msg)
-{
-	struct pubkey id;
-	u32 first, range;
-	struct peer *peer;
-
-	if (!fromwire_gossip_send_timestamp_filter(msg, &id, &first, &range))
-		master_badmsg(WIRE_GOSSIP_SEND_TIMESTAMP_FILTER, msg);
-
-	peer = find_peer(daemon, &id);
-	if (!peer) {
-		status_broken("send_timestamp_filter: unknown peer %s",
-			      type_to_string(tmpctx, struct pubkey, &id));
-		goto out;
-	}
-
-	if (!peer->gossip_queries_feature) {
-		status_broken("send_timestamp_filter: no gossip_query support in peer %s",
-			      type_to_string(tmpctx, struct pubkey, &id));
-		goto out;
-	}
-
-	msg = towire_gossip_timestamp_filter(NULL, &daemon->chain_hash,
-					     first, range);
-	queue_peer_msg(peer, take(msg));
-out:
-	return daemon_conn_read_next(conn, daemon->master);
-}
-
-/* FIXME: One day this will be called internally; for now it's just for
- * testing with dev_query_channel_range. */
-static struct io_plan *query_channel_range(struct io_conn *conn,
-					   struct daemon *daemon,
-					   const u8 *msg)
-{
-	struct pubkey id;
-	u32 first_blocknum, number_of_blocks;
-	struct peer *peer;
-
-	if (!fromwire_gossip_query_channel_range(msg, &id, &first_blocknum,
-						 &number_of_blocks))
-		master_badmsg(WIRE_GOSSIP_QUERY_SCIDS, msg);
-
-	peer = find_peer(daemon, &id);
-	if (!peer) {
-		status_broken("query_channel_range: unknown peer %s",
-			      type_to_string(tmpctx, struct pubkey, &id));
-		goto fail;
-	}
-
-	if (!peer->gossip_queries_feature) {
-		status_broken("query_channel_range: no gossip_query support in peer %s",
-			      type_to_string(tmpctx, struct pubkey, &id));
-		goto fail;
-	}
-
-	if (peer->query_channel_blocks) {
-		status_broken("query_channel_range: previous query active");
-		goto fail;
-	}
-
-	/* Check for overflow on 32-bit machines! */
-	if (BITMAP_NWORDS(number_of_blocks) < number_of_blocks / BITMAP_WORD_BITS) {
-		status_broken("query_channel_range: huge number_of_blocks (%u) not supported",
-			number_of_blocks);
-		goto fail;
-	}
-
-	status_debug("sending query_channel_range for blocks %u+%u",
-		     first_blocknum, number_of_blocks);
-	msg = towire_query_channel_range(NULL, &daemon->chain_hash,
-					 first_blocknum, number_of_blocks);
-	queue_peer_msg(peer, take(msg));
-	peer->range_first_blocknum = first_blocknum;
-	peer->range_end_blocknum = first_blocknum + number_of_blocks;
-	peer->range_blocks_remaining = number_of_blocks;
-	peer->query_channel_blocks = tal_arrz(peer, bitmap,
-					      BITMAP_NWORDS(number_of_blocks));
-	peer->query_channel_scids = tal_arr(peer, struct short_channel_id, 0);
-
-out:
-	return daemon_conn_read_next(conn, daemon->master);
-
-fail:
-	daemon_conn_send(daemon->master,
-			 take(towire_gossip_query_channel_range_reply(NULL,
-								      0, 0,
-								      false,
-								      NULL)));
-	goto out;
-}
-
-/* This is a testing hack to allow us to artificially lower the maximum bytes
- * of short_channel_ids we'll encode, using dev_set_max_scids_encode_size. */
-static struct io_plan *dev_set_max_scids_encode_size(struct io_conn *conn,
-						     struct daemon *daemon,
-						     const u8 *msg)
-{
-	if (!fromwire_gossip_dev_set_max_scids_encode_size(msg,
-							   &max_scids_encode_bytes))
-		master_badmsg(WIRE_GOSSIP_DEV_SET_MAX_SCIDS_ENCODE_SIZE, msg);
-
-	status_trace("Set max_scids_encode_bytes to %u", max_scids_encode_bytes);
-	return daemon_conn_read_next(conn, daemon->master);
-}
-
 /* Another testing hack */
-static struct io_plan *dev_gossip_suppress(struct io_conn *conn,
-					   struct daemon *daemon,
-					   const u8 *msg)
+static void dev_gossip_suppress(struct daemon *daemon, const u8 *msg)
 {
-	if (!fromwire_gossip_dev_suppress(msg))
-		master_badmsg(WIRE_GOSSIP_DEV_SUPPRESS, msg);
+	if (!fromwire_gossipd_dev_suppress(msg))
+		master_badmsg(WIRE_GOSSIPD_DEV_SUPPRESS, msg);
 
 	status_unusual("Suppressing all gossip");
-	suppress_gossip = true;
-	return daemon_conn_read_next(conn, daemon->master);
+	dev_suppress_gossip = true;
 }
 
-static struct io_plan *dev_gossip_memleak(struct io_conn *conn,
-					  struct daemon *daemon,
-					  const u8 *msg)
+static void dev_gossip_memleak(struct daemon *daemon, const u8 *msg)
 {
 	struct htable *memtable;
 	bool found_leak;
 
-	memtable = memleak_enter_allocations(tmpctx, msg, msg);
+	memtable = memleak_find_allocations(tmpctx, msg, msg);
 
 	/* Now delete daemon and those which it has pointers to. */
-	memleak_remove_referenced(memtable, daemon);
-	memleak_remove_routing_tables(memtable, daemon->rstate);
+	memleak_remove_region(memtable, daemon, sizeof(*daemon));
 
-	found_leak = dump_memleak(memtable);
+	found_leak = dump_memleak(memtable, memleak_status_broken);
 	daemon_conn_send(daemon->master,
-			 take(towire_gossip_dev_memleak_reply(NULL,
+			 take(towire_gossipd_dev_memleak_reply(NULL,
 							      found_leak)));
-	return daemon_conn_read_next(conn, daemon->master);
+}
+
+static void dev_compact_store(struct daemon *daemon, const u8 *msg)
+{
+	bool done = gossip_store_compact(daemon->rstate->gs);
+
+	daemon_conn_send(daemon->master,
+			 take(towire_gossipd_dev_compact_store_reply(NULL,
+								    done)));
+}
+
+static void dev_gossip_set_time(struct daemon *daemon, const u8 *msg)
+{
+	u32 time;
+
+	if (!fromwire_gossipd_dev_set_time(msg, &time))
+		master_badmsg(WIRE_GOSSIPD_DEV_SET_TIME, msg);
+	if (!daemon->rstate->gossip_time)
+		daemon->rstate->gossip_time = tal(daemon->rstate, struct timeabs);
+	daemon->rstate->gossip_time->ts.tv_sec = time;
+	daemon->rstate->gossip_time->ts.tv_nsec = 0;
 }
 #endif /* DEVELOPER */
 
-/*~ lightningd: so, tell me about this channel, so we can forward to it. */
-static struct io_plan *get_channel_peer(struct io_conn *conn,
-					struct daemon *daemon, const u8 *msg)
-{
-	struct short_channel_id scid;
-	struct chan *chan;
-	const struct pubkey *key;
-	int direction;
-
-	if (!fromwire_gossip_get_channel_peer(msg, &scid))
-		master_badmsg(WIRE_GOSSIP_GET_CHANNEL_PEER, msg);
-
-	chan = get_channel(daemon->rstate, &scid);
-	if (!chan) {
-		status_trace("Failed to resolve channel %s",
-			     type_to_string(tmpctx, struct short_channel_id, &scid));
-		key = NULL;
-	} else if (local_direction(daemon, chan, &direction)) {
-		key = &chan->nodes[!direction]->id;
-	} else {
-		status_trace("Resolved channel %s was not local",
-			     type_to_string(tmpctx, struct short_channel_id,
-					    &scid));
-		key = NULL;
-	}
-	daemon_conn_send(daemon->master,
-			 take(towire_gossip_get_channel_peer_reply(NULL, key)));
-	return daemon_conn_read_next(conn, daemon->master);
-}
-
 /*~ We queue incoming channel_announcement pending confirmation from lightningd
  * that it really is an unspent output.  Here's its reply. */
-static struct io_plan *handle_txout_reply(struct io_conn *conn,
-					  struct daemon *daemon, const u8 *msg)
+static void handle_txout_reply(struct daemon *daemon, const u8 *msg)
 {
 	struct short_channel_id scid;
 	u8 *outscript;
-	u64 satoshis;
+	struct amount_sat sat;
+	bool good;
 
-	if (!fromwire_gossip_get_txout_reply(msg, msg, &scid, &satoshis, &outscript))
-		master_badmsg(WIRE_GOSSIP_GET_TXOUT_REPLY, msg);
+	if (!fromwire_gossipd_get_txout_reply(msg, msg, &scid, &sat, &outscript))
+		master_badmsg(WIRE_GOSSIPD_GET_TXOUT_REPLY, msg);
 
 	/* Outscript is NULL if it's not an unspent output */
-	handle_pending_cannouncement(daemon->rstate, &scid, satoshis, outscript);
+	good = handle_pending_cannouncement(daemon, daemon->rstate,
+					    &scid, sat, outscript);
+
+	/* If we looking specifically for this, we no longer are. */
+	remove_unknown_scid(daemon->seeker, &scid, good);
 
 	/* Anywhere we might have announced a channel, we check if it's time to
 	 * announce ourselves (ie. if we just announced our own first channel) */
-	maybe_send_own_node_announce(daemon);
-
-	return daemon_conn_read_next(conn, daemon->master);
+	maybe_send_own_node_announce(daemon, false);
 }
 
-/* Fix up the channel_update to include the type if it doesn't currently have
- * one. See ElementsProject/lightning#1730 and lightningnetwork/lnd#1599 for the
- * in-depth discussion on why we break message parsing here... */
-static u8 *patch_channel_update(const tal_t *ctx, u8 *channel_update TAKES)
+/*~ lightningd tells us when about a gossip message directly, when told to by
+ * the addgossip RPC call.  That's usually used when a plugin gets an update
+ * returned in an payment error. */
+static void inject_gossip(struct daemon *daemon, const u8 *msg)
 {
-	u8 *fixed;
-	if (channel_update != NULL &&
-	    fromwire_peektype(channel_update) != WIRE_CHANNEL_UPDATE) {
-		/* This should be a channel_update, prefix with the
-		 * WIRE_CHANNEL_UPDATE type, but isn't. Let's prefix it. */
-		fixed = tal_arr(ctx, u8, 0);
-		towire_u16(&fixed, WIRE_CHANNEL_UPDATE);
-		towire(&fixed, channel_update, tal_bytelen(channel_update));
-		if (taken(channel_update))
-			tal_free(channel_update);
-		return fixed;
-	} else {
-		return tal_dup_arr(ctx, u8,
-				   channel_update, tal_count(channel_update), 0);
+	u8 *goss;
+	const u8 *errmsg;
+	const char *err;
+
+	if (!fromwire_gossipd_addgossip(msg, msg, &goss))
+		master_badmsg(WIRE_GOSSIPD_ADDGOSSIP, msg);
+
+	switch (fromwire_peektype(goss)) {
+	case WIRE_CHANNEL_ANNOUNCEMENT:
+		errmsg = handle_channel_announcement_msg(daemon, NULL, goss);
+		break;
+	case WIRE_NODE_ANNOUNCEMENT:
+		errmsg = handle_node_announcement(daemon->rstate, goss,
+						  NULL, NULL);
+		break;
+	case WIRE_CHANNEL_UPDATE:
+		errmsg = handle_channel_update(daemon->rstate, goss,
+					       NULL, NULL, true);
+		break;
+	default:
+		err = tal_fmt(tmpctx, "unknown gossip type %i",
+			      fromwire_peektype(goss));
+		goto err_extracted;
 	}
+
+	/* The APIs above are designed to send error messages back to peers:
+	 * we extract the raw string instead. */
+	if (errmsg) {
+		err = sanitize_error(tmpctx, errmsg, NULL);
+		tal_free(errmsg);
+	} else
+		/* Send empty string if no error. */
+		err = "";
+
+err_extracted:
+	daemon_conn_send(daemon->master,
+			 take(towire_gossipd_addgossip_reply(NULL, err)));
 }
 
-/* Return NULL if the wrapped onion error message has no channel_update field,
- * or return the embedded channel_update message otherwise. */
-static u8 *channel_update_from_onion_error(const tal_t *ctx,
-					   const u8 *onion_message)
+static void handle_new_lease_rates(struct daemon *daemon, const u8 *msg)
 {
-	u8 *channel_update = NULL;
-	u64 unused64;
-	u32 unused32;
+	struct lease_rates *rates = tal(daemon, struct lease_rates);
 
-	/* Identify failcodes that have some channel_update.
-	 *
-	 * TODO > BOLT 1.0: Add new failcodes when updating to a
-	 * new BOLT version. */
-	if (!fromwire_temporary_channel_failure(ctx,
-						onion_message,
-						&channel_update) &&
-	    !fromwire_amount_below_minimum(ctx,
-					   onion_message, &unused64,
-					   &channel_update) &&
-	    !fromwire_fee_insufficient(ctx,
-		    		       onion_message, &unused64,
-				       &channel_update) &&
-	    !fromwire_incorrect_cltv_expiry(ctx,
-		    			    onion_message, &unused32,
-					    &channel_update) &&
-	    !fromwire_expiry_too_soon(ctx,
-		    		      onion_message,
-				      &channel_update))
-		/* No channel update. */
-		return NULL;
+	if (!fromwire_gossipd_new_lease_rates(msg, rates))
+		master_badmsg(WIRE_GOSSIPD_NEW_LEASE_RATES, msg);
 
-	return patch_channel_update(ctx, take(channel_update));
-}
+	daemon->rates = tal_free(daemon->rates);
+	if (!lease_rates_empty(rates))
+		daemon->rates = rates;
+	else
+		tal_free(rates);
 
-/*~ lightningd tells us when a payment has failed; we mark the channel (or
- * node) unusable here if it's a permanent failure, and unpack any
- * channel_update contained in the error. */
-static struct io_plan *handle_payment_failure(struct io_conn *conn,
-					      struct daemon *daemon,
-					      const u8 *msg)
-{
-	struct pubkey erring_node;
-	struct short_channel_id erring_channel;
-	u8 erring_channel_direction;
-	u8 *error;
-	enum onion_type failcode;
-	u8 *channel_update;
-
-	if (!fromwire_gossip_payment_failure(msg, msg,
-					     &erring_node,
-					     &erring_channel,
-					     &erring_channel_direction,
-					     &error))
-		master_badmsg(WIRE_GOSSIP_PAYMENT_FAILURE, msg);
-
-	failcode = fromwire_peektype(error);
-	channel_update = channel_update_from_onion_error(tmpctx, error);
-	if (channel_update)
-		status_debug("Extracted channel_update %s from onionreply %s",
-			     tal_hex(tmpctx, channel_update),
-			     tal_hex(tmpctx, error));
-	routing_failure(daemon->rstate,
-			&erring_node,
-			&erring_channel,
-			erring_channel_direction,
-			failcode,
-			channel_update);
-
-	return daemon_conn_read_next(conn, daemon->master);
+	/* Send the update over to the peer */
+	maybe_send_own_node_announce(daemon, false);
 }
 
 /*~ This is where lightningd tells us that a channel's funding transaction has
  * been spent. */
-static struct io_plan *handle_outpoint_spent(struct io_conn *conn,
-					     struct daemon *daemon,
-					     const u8 *msg)
+static void handle_outpoint_spent(struct daemon *daemon, const u8 *msg)
 {
 	struct short_channel_id scid;
 	struct chan *chan;
 	struct routing_state *rstate = daemon->rstate;
-	if (!fromwire_gossip_outpoint_spent(msg, &scid))
-		master_badmsg(WIRE_GOSSIP_OUTPOINT_SPENT, msg);
+	if (!fromwire_gossipd_outpoint_spent(msg, &scid))
+		master_badmsg(WIRE_GOSSIPD_OUTPOINT_SPENT, msg);
 
 	chan = get_channel(rstate, &scid);
 	if (chan) {
-		status_trace(
+		status_debug(
 		    "Deleting channel %s due to the funding outpoint being "
 		    "spent",
 		    type_to_string(msg, struct short_channel_id, &scid));
+		/* Suppress any now-obsolete updates/announcements */
+		add_to_txout_failures(rstate, &scid);
+		remove_channel_from_store(rstate, chan);
 		/* Freeing is sufficient since everything else is allocated off
-		 * of the channel and the destructor takes care of unregistering
+		 * of the channel and this takes care of unregistering
 		 * the channel */
-		tal_free(chan);
-		/* We put a tombstone marker in the channel store, so we don't
-		 * have to replay blockchain spends on restart. */
-		gossip_store_add_channel_delete(rstate->store, &scid);
+		free_chan(rstate, chan);
 	}
-
-	return daemon_conn_read_next(conn, daemon->master);
 }
 
 /*~ This is sent by lightningd when it kicks off 'closingd': we disable it
@@ -2643,20 +916,27 @@ static struct io_plan *handle_outpoint_spent(struct io_conn *conn,
  * channels. This does not send out updates since that's triggered by the peer
  * connection closing.
  */
-static struct io_plan *handle_local_channel_close(struct io_conn *conn,
-						  struct daemon *daemon,
-						  const u8 *msg)
+static void handle_local_channel_close(struct daemon *daemon, const u8 *msg)
 {
 	struct short_channel_id scid;
 	struct chan *chan;
 	struct routing_state *rstate = daemon->rstate;
-	if (!fromwire_gossip_local_channel_close(msg, &scid))
-		master_badmsg(WIRE_GOSSIP_LOCAL_CHANNEL_CLOSE, msg);
+	if (!fromwire_gossipd_local_channel_close(msg, &scid))
+		master_badmsg(WIRE_GOSSIPD_LOCAL_CHANNEL_CLOSE, msg);
 
 	chan = get_channel(rstate, &scid);
-	if (chan)
-		chan->local_disabled = true;
-	return daemon_conn_read_next(conn, daemon->master);
+	if (chan) {
+		int direction;
+
+		if (!local_direction(rstate, chan, &direction)) {
+			status_broken("Non-local channel close %s",
+				      type_to_string(tmpctx,
+						     struct short_channel_id,
+						     &scid));
+		} else {
+			local_disable_chan(daemon, chan, direction);
+		}
+	}
 }
 
 /*~ This routine handles all the commands from lightningd. */
@@ -2664,85 +944,98 @@ static struct io_plan *recv_req(struct io_conn *conn,
 				const u8 *msg,
 				struct daemon *daemon)
 {
-	enum gossip_wire_type t = fromwire_peektype(msg);
+	enum gossipd_wire t = fromwire_peektype(msg);
 
 	switch (t) {
-	case WIRE_GOSSIPCTL_INIT:
-		return gossip_init(conn, daemon, msg);
+	case WIRE_GOSSIPD_INIT:
+		gossip_init(daemon, msg);
+		goto done;
 
-	case WIRE_GOSSIP_GETNODES_REQUEST:
-		return getnodes(conn, daemon, msg);
+	case WIRE_GOSSIPD_GET_TXOUT_REPLY:
+		handle_txout_reply(daemon, msg);
+		goto done;
 
-	case WIRE_GOSSIP_GETROUTE_REQUEST:
-		return getroute_req(conn, daemon, msg);
+	case WIRE_GOSSIPD_OUTPOINT_SPENT:
+		handle_outpoint_spent(daemon, msg);
+		goto done;
 
-	case WIRE_GOSSIP_GETCHANNELS_REQUEST:
-		return getchannels_req(conn, daemon, msg);
+	case WIRE_GOSSIPD_LOCAL_CHANNEL_CLOSE:
+		handle_local_channel_close(daemon, msg);
+		goto done;
 
-	case WIRE_GOSSIP_GET_CHANNEL_PEER:
-		return get_channel_peer(conn, daemon, msg);
+	case WIRE_GOSSIPD_NEW_BLOCKHEIGHT:
+		new_blockheight(daemon, msg);
+		goto done;
 
-	case WIRE_GOSSIP_GET_TXOUT_REPLY:
-		return handle_txout_reply(conn, daemon, msg);
+	case WIRE_GOSSIPD_ADDGOSSIP:
+		inject_gossip(daemon, msg);
+		goto done;
 
-	case WIRE_GOSSIP_PAYMENT_FAILURE:
-		return handle_payment_failure(conn, daemon, msg);
+	case WIRE_GOSSIPD_NEW_LEASE_RATES:
+		handle_new_lease_rates(daemon, msg);
+		goto done;
 
-	case WIRE_GOSSIP_OUTPOINT_SPENT:
-		return handle_outpoint_spent(conn, daemon, msg);
+	case WIRE_GOSSIPD_GET_ADDRS:
+		return handle_get_address(conn, daemon, msg);
 
-	case WIRE_GOSSIP_LOCAL_CHANNEL_CLOSE:
-		return handle_local_channel_close(conn, daemon, msg);
+	case WIRE_GOSSIPD_USED_LOCAL_CHANNEL_UPDATE:
+		handle_used_local_channel_update(daemon, msg);
+		goto done;
 
-	case WIRE_GOSSIP_PING:
-		return ping_req(conn, daemon, msg);
+	case WIRE_GOSSIPD_LOCAL_CHANNEL_UPDATE:
+		handle_local_channel_update(daemon, msg);
+		goto done;
 
-	case WIRE_GOSSIP_GET_INCOMING_CHANNELS:
-		return get_incoming_channels(conn, daemon, msg);
+	case WIRE_GOSSIPD_LOCAL_CHANNEL_ANNOUNCEMENT:
+		handle_local_channel_announcement(daemon, msg);
+		goto done;
 
+	case WIRE_GOSSIPD_LOCAL_PRIVATE_CHANNEL:
+		handle_local_private_channel(daemon, msg);
+		goto done;
 #if DEVELOPER
-	case WIRE_GOSSIP_QUERY_SCIDS:
-		return query_scids_req(conn, daemon, msg);
-
-	case WIRE_GOSSIP_SEND_TIMESTAMP_FILTER:
-		return send_timestamp_filter(conn, daemon, msg);
-
-	case WIRE_GOSSIP_QUERY_CHANNEL_RANGE:
-		return query_channel_range(conn, daemon, msg);
-
-	case WIRE_GOSSIP_DEV_SET_MAX_SCIDS_ENCODE_SIZE:
-		return dev_set_max_scids_encode_size(conn, daemon, msg);
-	case WIRE_GOSSIP_DEV_SUPPRESS:
-		return dev_gossip_suppress(conn, daemon, msg);
-	case WIRE_GOSSIP_DEV_MEMLEAK:
-		return dev_gossip_memleak(conn, daemon, msg);
+	case WIRE_GOSSIPD_DEV_SET_MAX_SCIDS_ENCODE_SIZE:
+		dev_set_max_scids_encode_size(daemon, msg);
+		goto done;
+	case WIRE_GOSSIPD_DEV_SUPPRESS:
+		dev_gossip_suppress(daemon, msg);
+		goto done;
+	case WIRE_GOSSIPD_DEV_MEMLEAK:
+		dev_gossip_memleak(daemon, msg);
+		goto done;
+	case WIRE_GOSSIPD_DEV_COMPACT_STORE:
+		dev_compact_store(daemon, msg);
+		goto done;
+	case WIRE_GOSSIPD_DEV_SET_TIME:
+		dev_gossip_set_time(daemon, msg);
+		goto done;
 #else
-	case WIRE_GOSSIP_QUERY_SCIDS:
-	case WIRE_GOSSIP_SEND_TIMESTAMP_FILTER:
-	case WIRE_GOSSIP_QUERY_CHANNEL_RANGE:
-	case WIRE_GOSSIP_DEV_SET_MAX_SCIDS_ENCODE_SIZE:
-	case WIRE_GOSSIP_DEV_SUPPRESS:
-	case WIRE_GOSSIP_DEV_MEMLEAK:
+	case WIRE_GOSSIPD_DEV_SET_MAX_SCIDS_ENCODE_SIZE:
+	case WIRE_GOSSIPD_DEV_SUPPRESS:
+	case WIRE_GOSSIPD_DEV_MEMLEAK:
+	case WIRE_GOSSIPD_DEV_COMPACT_STORE:
+	case WIRE_GOSSIPD_DEV_SET_TIME:
 		break;
 #endif /* !DEVELOPER */
 
 	/* We send these, we don't receive them */
-	case WIRE_GOSSIP_GETNODES_REPLY:
-	case WIRE_GOSSIP_GETROUTE_REPLY:
-	case WIRE_GOSSIP_GETCHANNELS_REPLY:
-	case WIRE_GOSSIP_PING_REPLY:
-	case WIRE_GOSSIP_SCIDS_REPLY:
-	case WIRE_GOSSIP_QUERY_CHANNEL_RANGE_REPLY:
-	case WIRE_GOSSIP_GET_CHANNEL_PEER_REPLY:
-	case WIRE_GOSSIP_GET_INCOMING_CHANNELS_REPLY:
-	case WIRE_GOSSIP_GET_TXOUT:
-	case WIRE_GOSSIP_DEV_MEMLEAK_REPLY:
+	case WIRE_GOSSIPD_INIT_REPLY:
+	case WIRE_GOSSIPD_GET_TXOUT:
+	case WIRE_GOSSIPD_DEV_MEMLEAK_REPLY:
+	case WIRE_GOSSIPD_DEV_COMPACT_STORE_REPLY:
+	case WIRE_GOSSIPD_ADDGOSSIP_REPLY:
+	case WIRE_GOSSIPD_NEW_BLOCKHEIGHT_REPLY:
+	case WIRE_GOSSIPD_GET_ADDRS_REPLY:
+	case WIRE_GOSSIPD_GOT_LOCAL_CHANNEL_UPDATE:
 		break;
 	}
 
 	/* Master shouldn't give bad requests. */
 	status_failed(STATUS_FAIL_MASTER_IO, "%i: %s",
 		      t, tal_hex(tmpctx, msg));
+
+done:
+	return daemon_conn_read_next(conn, daemon->master);
 }
 
 /* This is called when lightningd closes its connection to us.  We simply
@@ -2764,6 +1057,14 @@ int main(int argc, char *argv[])
 
 	daemon = tal(NULL, struct daemon);
 	list_head_init(&daemon->peers);
+	daemon->deferred_txouts = tal_arr(daemon, struct short_channel_id, 0);
+	daemon->node_announce_timer = NULL;
+	daemon->current_blockheight = 0; /* i.e. unknown */
+	daemon->rates = NULL;
+	list_head_init(&daemon->deferred_updates);
+
+	/* Tell the ecdh() function how to talk to hsmd */
+	ecdh_hsmd_setup(HSM_FD, status_failed);
 
 	/* Note the use of time_mono() here.  That's a monotonic clock, which
 	 * is really useful: it can only be used to measure relative events
@@ -2779,10 +1080,6 @@ int main(int argc, char *argv[])
 
 	status_setup_async(daemon->master);
 
-	/* connectd is already started, and uses this fd to ask us things. */
-	daemon->connectd = daemon_conn_new(daemon, CONNECTD_FD,
-					   connectd_req, NULL, daemon);
-
 	/* This loop never exits.  io_loop() only returns if a timer has
 	 * expired, or io_break() is called, or all fds are closed.  We don't
 	 * use io_break and closing the lightningd fd calls master_gone()
@@ -2791,13 +1088,13 @@ int main(int argc, char *argv[])
 		struct timer *expired = NULL;
 		io_loop(&daemon->timers, &expired);
 
-		timer_expired(daemon, expired);
+		timer_expired(expired);
 	}
 }
 
 /*~ Note that the actual routing stuff is in routing.c; you might want to
  * check that out later.
  *
- * But that's the last of the global daemons.   We now move on to the first of
+ * But that's the last of the global daemons.  We now move on to the first of
  * the per-peer daemons: openingd/openingd.c.
  */

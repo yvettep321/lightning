@@ -1,22 +1,22 @@
 #ifndef LIGHTNING_CONNECTD_HANDSHAKE_H
 #define LIGHTNING_CONNECTD_HANDSHAKE_H
 #include "config.h"
-#include <ccan/tal/tal.h>
-#include <ccan/typesafe_cb/typesafe_cb.h>
 
 struct crypto_state;
 struct io_conn;
 struct wireaddr_internal;
 struct pubkey;
+struct oneshot;
 
-#define initiator_handshake(conn, my_id, their_id, addr, cb, cbarg)	\
-	initiator_handshake_((conn), (my_id), (their_id), (addr),	\
+#define initiator_handshake(conn, my_id, their_id, addr, timeout, cb, cbarg) \
+	initiator_handshake_((conn), (my_id), (their_id), (addr), (timeout), \
 			     typesafe_cb_preargs(struct io_plan *, void *, \
 						 (cb), (cbarg),		\
 						 struct io_conn *,	\
 						 const struct pubkey *,	\
-						 const struct wireaddr_internal *,	\
-						 const struct crypto_state *), \
+						 const struct wireaddr_internal *, \
+						 struct crypto_state *, \
+						 struct oneshot *),	\
 			     (cbarg))
 
 
@@ -24,34 +24,36 @@ struct io_plan *initiator_handshake_(struct io_conn *conn,
 				     const struct pubkey *my_id,
 				     const struct pubkey *their_id,
 				     const struct wireaddr_internal *addr,
+				     struct oneshot *timeout,
 				     struct io_plan *(*cb)(struct io_conn *,
 							   const struct pubkey *,
 							   const struct wireaddr_internal *,
-							   const struct crypto_state *,
+							   struct crypto_state *,
+							   struct oneshot *timeout,
 							   void *cbarg),
 				     void *cbarg);
 
 
-#define responder_handshake(conn, my_id, addr, cb, cbarg)		\
-	responder_handshake_((conn), (my_id), (addr),			\
+#define responder_handshake(conn, my_id, addr, timeout, cb, cbarg)	\
+	responder_handshake_((conn), (my_id), (addr), (timeout),	\
 			     typesafe_cb_preargs(struct io_plan *, void *, \
 						 (cb), (cbarg),		\
 						 struct io_conn *,	\
 						 const struct pubkey *,	\
-						 const struct wireaddr_internal *,	\
-						 const struct crypto_state *), \
+						 const struct wireaddr_internal *, \
+						 struct crypto_state *, \
+						 struct oneshot *),	\
 			     (cbarg))
 
 struct io_plan *responder_handshake_(struct io_conn *conn,
 				     const struct pubkey *my_id,
 				     const struct wireaddr_internal *addr,
+				     struct oneshot *timeout,
 				     struct io_plan *(*cb)(struct io_conn *,
 							   const struct pubkey *,
 							   const struct wireaddr_internal *,
-							   const struct crypto_state *,
+							   struct crypto_state *,
+							   struct oneshot *,
 							   void *cbarg),
 				     void *cbarg);
-
-/* helper which is defined in connect.c */
-struct secret *hsm_do_ecdh(const tal_t *ctx, const struct pubkey *point);
 #endif /* LIGHTNING_CONNECTD_HANDSHAKE_H */
