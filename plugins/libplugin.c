@@ -1,19 +1,21 @@
-#include "config.h"
 #include <bitcoin/chainparams.h>
-#include <bitcoin/privkey.h>
+#include <ccan/err/err.h>
 #include <ccan/io/io.h>
 #include <ccan/json_out/json_out.h>
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/tal/str/str.h>
 #include <common/daemon.h>
 #include <common/json_stream.h>
-#include <common/memleak.h>
-#include <common/route.h>
+#include <common/utils.h>
 #include <errno.h>
 #include <plugins/libplugin.h>
-#include <stdio.h>
+#include <poll.h>
+#include <stdarg.h>
+#include <string.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/un.h>
+#include <unistd.h>
 
 #define READ_CHUNKSIZE 4096
 
@@ -38,8 +40,6 @@ struct plugin {
 	/* To read from lightningd */
 	char *buffer;
 	size_t used, len_read;
-	jsmn_parser parser;
-	jsmntok_t *toks;
 
 	/* To write to lightningd */
 	struct json_stream **js_arr;
@@ -49,8 +49,6 @@ struct plugin {
 	struct json_stream **rpc_js_arr;
 	char *rpc_buffer;
 	size_t rpc_used, rpc_len_read;
-	jsmn_parser rpc_parser;
-	jsmntok_t *rpc_toks;
 	/* Tracking async RPC requests */
 	UINTMAP(struct out_req *) out_reqs;
 	u64 next_outreq_id;
@@ -58,7 +56,7 @@ struct plugin {
 	/* Synchronous RPC interaction */
 	struct rpc_conn *rpc_conn;
 
-	/* Plugin information details */
+	/* Plugin informations */
 	enum plugin_restartability restartability;
 	const struct plugin_command *commands;
 	size_t num_commands;
@@ -69,14 +67,12 @@ struct plugin {
 	struct plugin_option *opts;
 
 	/* Anything special to do at init ? */
-	const char *(*init)(struct plugin *p,
-			    const char *buf, const jsmntok_t *);
+	void (*init)(struct plugin *p,
+		     const char *buf, const jsmntok_t *);
 	/* Has the manifest been sent already ? */
 	bool manifested;
 	/* Has init been received ? */
 	bool initialized;
-	/* Are we exiting? */
-	bool exiting;
 
 	/* Map from json command names to usage strings: we don't put this inside
 	 * struct json_command as it's good practice to have those const. */
@@ -87,18 +83,6 @@ struct plugin {
 
 	/* Feature set for lightningd */
 	struct feature_set *our_features;
-
-	/* Location of the RPC filename in case we need to defer RPC
-	 * initialization or need to recover from a disconnect. */
-	const char *rpc_location;
-
-	const char **notif_topics;
-	size_t num_notif_topics;
-
-#if DEVELOPER
-	/* Lets them remove ptrs from leak detection. */
-	void (*mark_mem)(struct plugin *plugin, struct htable *memtable);
-#endif
 };
 
 /* command_result is mainly used as a compile-time check to encourage you
@@ -114,10 +98,6 @@ struct command_result *command_param_failed(void)
 	return &complete;
 }
 
-struct command_result *command_done(void)
-{
-	return &complete;
-}
 
 static void ld_send(struct plugin *plugin, struct json_stream *stream)
 {
@@ -234,8 +214,8 @@ static struct command_result *command_complete(struct command *cmd,
 	return &complete;
 }
 
-struct command_result *command_finished(struct command *cmd,
-					struct json_stream *response)
+struct command_result *WARN_UNUSED_RESULT
+command_finished(struct command *cmd, struct json_stream *response)
 {
 	/* "result" or "error" object */
 	json_object_end(response);
@@ -349,6 +329,21 @@ command_success(struct command *cmd, const struct json_out *result)
 	return command_complete(cmd, js);
 }
 
+struct command_result *WARN_UNUSED_RESULT
+command_success_str(struct command *cmd, const char *str)
+{
+	struct json_stream *js = jsonrpc_stream_start(cmd);
+
+	if (str)
+		json_add_string(js, "result", str);
+	else {
+		/* Use an empty object if they don't want anything. */
+		json_object_start(js, "result");
+		json_object_end(js);
+	}
+	return command_complete(cmd, js);
+}
+
 struct command_result *command_done_err(struct command *cmd,
 					errcode_t code,
 					const char *errmsg,
@@ -443,19 +438,14 @@ static const jsmntok_t *read_rpc_reply(const tal_t *ctx,
 				       int *reqlen)
 {
 	const jsmntok_t *toks;
+	bool valid;
 
-	do {
-		*reqlen = read_json_from_rpc(plugin);
+	*reqlen = read_json_from_rpc(plugin);
 
-		toks = json_parse_simple(ctx,
-					 membuf_elems(&plugin->rpc_conn->mb),
-					 *reqlen);
-		if (!toks)
-			plugin_err(plugin, "Malformed JSON reply '%.*s'",
-				   *reqlen, membuf_elems(&plugin->rpc_conn->mb));
-		/* FIXME: Don't simply ignore notifications here! */
-	} while (!json_get_member(membuf_elems(&plugin->rpc_conn->mb), toks,
-				  "id"));
+	toks = json_parse_input(ctx, membuf_elems(&plugin->rpc_conn->mb), *reqlen, &valid);
+	if (!valid)
+		plugin_err(plugin, "Malformed JSON reply '%.*s'",
+			   *reqlen, membuf_elems(&plugin->rpc_conn->mb));
 
 	*contents = json_get_member(membuf_elems(&plugin->rpc_conn->mb), toks, "error");
 	if (*contents)
@@ -487,20 +477,18 @@ static struct json_out *start_json_request(const tal_t *ctx,
 	return jout;
 }
 
-/* Synchronous routine to send command and extract fields from response */
-void rpc_scan(struct plugin *plugin,
-	      const char *method,
-	      const struct json_out *params TAKES,
-	      const char *guide,
-	      ...)
+/* Synchronous routine to send command and extract single field from response */
+const char *rpc_delve(const tal_t *ctx,
+		      struct plugin *plugin,
+		      const char *method,
+		      const struct json_out *params TAKES,
+		      const char *guide)
 {
 	bool error;
-	const char *err;
-	const jsmntok_t *contents;
+	const jsmntok_t *contents, *t;
 	int reqlen;
-	const char *p;
+	const char *ret;
 	struct json_out *jout;
-	va_list ap;
 
 	jout = start_json_request(tmpctx, 0, method, params);
 	finish_and_send_json(plugin->rpc_conn->fd, jout);
@@ -510,16 +498,14 @@ void rpc_scan(struct plugin *plugin,
 		plugin_err(plugin, "Got error reply to %s: '%.*s'",
 		     method, reqlen, membuf_elems(&plugin->rpc_conn->mb));
 
-	p = membuf_consume(&plugin->rpc_conn->mb, reqlen);
+	t = json_delve(membuf_elems(&plugin->rpc_conn->mb), contents, guide);
+	if (!t)
+		plugin_err(plugin, "Could not find %s in reply to %s: '%.*s'",
+			   guide, method, reqlen, membuf_elems(&plugin->rpc_conn->mb));
 
-	va_start(ap, guide);
-	err = json_scanv(tmpctx, p, contents, guide, ap);
-	va_end(ap);
-
-	if (err)
-		plugin_err(plugin, "Could not parse %s in reply to %s: %s: '%.*s'",
-			   guide, method, err,
-			   reqlen, membuf_elems(&plugin->rpc_conn->mb));
+	ret = json_strdup(ctx, membuf_elems(&plugin->rpc_conn->mb), t);
+	membuf_consume(&plugin->rpc_conn->mb, reqlen);
+	return ret;
 }
 
 static void handle_rpc_reply(struct plugin *plugin, const jsmntok_t *toks)
@@ -531,9 +517,9 @@ static void handle_rpc_reply(struct plugin *plugin, const jsmntok_t *toks)
 
 	idtok = json_get_member(plugin->rpc_buffer, toks, "id");
 	if (!idtok)
-		/* FIXME: Don't simply ignore notifications! */
-		return;
-
+		plugin_err(plugin, "JSON reply without id '%.*s'",
+			   json_tok_full_len(toks),
+			   json_tok_full(plugin->rpc_buffer, toks));
 	if (!json_to_u64(plugin->rpc_buffer, idtok, &id))
 		plugin_err(plugin, "JSON reply without numeric id '%.*s'",
 			   json_tok_full_len(toks),
@@ -578,25 +564,10 @@ send_outreq(struct plugin *plugin, const struct out_req *req)
 }
 
 static struct command_result *
-handle_getmanifest(struct command *getmanifest_cmd,
-		   const char *buf,
-		   const jsmntok_t *getmanifest_params)
+handle_getmanifest(struct command *getmanifest_cmd)
 {
 	struct json_stream *params = jsonrpc_stream_success(getmanifest_cmd);
 	struct plugin *p = getmanifest_cmd->plugin;
-	const jsmntok_t *dep;
-	bool has_shutdown_notif;
-
-	/* This was added post 0.9.0 */
-	dep = json_get_member(buf, getmanifest_params, "allow-deprecated-apis");
-	if (!dep)
-		deprecated_apis = true;
-	else {
-		if (!json_to_bool(buf, dep, &deprecated_apis))
-			plugin_err(p, "Invalid allow-deprecated-apis '%.*s'",
-				   json_tok_full_len(dep),
-				   json_tok_full(buf, dep));
-	}
 
 	json_array_start(params, "options");
 	for (size_t i = 0; i < tal_count(p->opts); i++) {
@@ -604,7 +575,6 @@ handle_getmanifest(struct command *getmanifest_cmd,
 		json_add_string(params, "name", p->opts[i].name);
 		json_add_string(params, "type", p->opts[i].type);
 		json_add_string(params, "description", p->opts[i].description);
-		json_add_bool(params, "deprecated", p->opts[i].deprecated);
 		json_object_end(params);
 	}
 	json_array_end(params);
@@ -619,48 +589,18 @@ handle_getmanifest(struct command *getmanifest_cmd,
 		if (p->commands[i].long_description)
 			json_add_string(params, "long_description",
 					p->commands[i].long_description);
-		json_add_bool(params, "deprecated", p->commands[i].deprecated);
 		json_object_end(params);
 	}
 	json_array_end(params);
 
 	json_array_start(params, "subscriptions");
-	has_shutdown_notif = false;
-	for (size_t i = 0; i < p->num_notif_subs; i++) {
+	for (size_t i = 0; i < p->num_notif_subs; i++)
 		json_add_string(params, NULL, p->notif_subs[i].name);
-		if (streq(p->notif_subs[i].name, "shutdown"))
-			has_shutdown_notif = true;
-	}
-#if DEVELOPER
-	/* For memleak detection, always get notified of shutdown. */
-	if (!has_shutdown_notif)
-		json_add_string(params, NULL, "shutdown");
-#else
-	/* Don't care this is unused: compiler don't complain! */
-	(void)has_shutdown_notif;
-#endif
 	json_array_end(params);
 
 	json_array_start(params, "hooks");
-	for (size_t i = 0; i < p->num_hook_subs; i++) {
-		json_object_start(params, NULL);
-		json_add_string(params, "name", p->hook_subs[i].name);
-		if (p->hook_subs[i].before) {
-			json_array_start(params, "before");
-			for (size_t j = 0; p->hook_subs[i].before[j]; j++)
-				json_add_string(params, NULL,
-						p->hook_subs[i].before[j]);
-			json_array_end(params);
-		}
-		if (p->hook_subs[i].after) {
-			json_array_start(params, "after");
-			for (size_t j = 0; p->hook_subs[i].after[j]; j++)
-				json_add_string(params, NULL,
-						p->hook_subs[i].after[j]);
-			json_array_end(params);
-		}
-		json_object_end(params);
-	}
+	for (size_t i = 0; i < p->num_hook_subs; i++)
+		json_add_string(params, NULL, p->hook_subs[i].name);
 	json_array_end(params);
 
 	if (p->our_features != NULL) {
@@ -677,14 +617,6 @@ handle_getmanifest(struct command *getmanifest_cmd,
 
 	json_add_bool(params, "dynamic", p->restartability == PLUGIN_RESTARTABLE);
 
-	json_array_start(params, "notifications");
-	for (size_t i = 0; p->notif_topics && i < p->num_notif_topics; i++) {
-		json_object_start(params, NULL);
-		json_add_string(params, "method", p->notif_topics[i]);
-		json_object_end(params);
-	}
-	json_array_end(params);
-
 	return command_finished(getmanifest_cmd, params);
 }
 
@@ -696,44 +628,44 @@ static void rpc_conn_finished(struct io_conn *conn,
 
 static bool rpc_read_response_one(struct plugin *plugin)
 {
-	const jsmntok_t *jrtok;
-	bool complete;
+	bool valid;
+	const jsmntok_t *toks, *jrtok;
 
-	if (!json_parse_input(&plugin->rpc_parser, &plugin->rpc_toks,
-			      plugin->rpc_buffer, plugin->rpc_used, &complete)) {
-		plugin_err(plugin, "Failed to parse RPC JSON response '%.*s'",
-			   (int)plugin->rpc_used, plugin->rpc_buffer);
-		return false;
-	}
-
-	if (!complete) {
+	/* FIXME: This could be done more efficiently by storing the
+	 * toks and doing an incremental parse, like lightning-cli
+	 * does. */
+	toks = json_parse_input(NULL, plugin->rpc_buffer, plugin->rpc_used,
+				&valid);
+	if (!toks) {
+		if (!valid) {
+			plugin_err(plugin, "Failed to parse RPC JSON response '%.*s'",
+				   (int)plugin->rpc_used, plugin->rpc_buffer);
+			return false;
+		}
 		/* We need more. */
 		return false;
 	}
 
 	/* Empty buffer? (eg. just whitespace). */
-	if (tal_count(plugin->rpc_toks) == 1) {
+	if (tal_count(toks) == 1) {
 		plugin->rpc_used = 0;
-		jsmn_init(&plugin->rpc_parser);
-		toks_reset(plugin->rpc_toks);
 		return false;
 	}
 
-	jrtok = json_get_member(plugin->rpc_buffer, plugin->rpc_toks, "jsonrpc");
+	jrtok = json_get_member(plugin->rpc_buffer, toks, "jsonrpc");
 	if (!jrtok) {
 		plugin_err(plugin, "JSON-RPC message does not contain \"jsonrpc\" field: '%.*s'",
                                    (int)plugin->rpc_used, plugin->rpc_buffer);
 		return false;
 	}
 
-	handle_rpc_reply(plugin, plugin->rpc_toks);
+	handle_rpc_reply(plugin, toks);
 
 	/* Move this object out of the buffer */
-	memmove(plugin->rpc_buffer, plugin->rpc_buffer + plugin->rpc_toks[0].end,
-		tal_count(plugin->rpc_buffer) - plugin->rpc_toks[0].end);
-	plugin->rpc_used -= plugin->rpc_toks[0].end;
-	jsmn_init(&plugin->rpc_parser);
-	toks_reset(plugin->rpc_toks);
+	memmove(plugin->rpc_buffer, plugin->rpc_buffer + toks[0].end,
+		tal_count(plugin->rpc_buffer) - toks[0].end);
+	plugin->rpc_used -= toks[0].end;
+	tal_free(toks);
 
 	return true;
 }
@@ -824,59 +756,51 @@ static struct command_result *handle_init(struct command *cmd,
 					  const char *buf,
 					  const jsmntok_t *params)
 {
-	const jsmntok_t *configtok, *opttok, *t;
+	const jsmntok_t *configtok, *rpctok, *dirtok, *opttok, *nettok, *fsettok,
+		*t;
 	struct sockaddr_un addr;
 	size_t i;
 	char *dir, *network;
+	struct json_out *param_obj;
 	struct plugin *p = cmd->plugin;
-	bool with_rpc = p->rpc_conn != NULL;
-	const char *err;
+	bool with_rpc = true;
 
-	configtok = json_get_member(buf, params, "configuration");
-	err = json_scan(tmpctx, buf, configtok,
-			"{lightning-dir:%"
-			",network:%"
-			",feature_set:%"
-			",rpc-file:%}",
-			JSON_SCAN_TAL(tmpctx, json_strdup, &dir),
-			JSON_SCAN_TAL(tmpctx, json_strdup, &network),
-			JSON_SCAN_TAL(p, json_to_feature_set, &p->our_features),
-			JSON_SCAN_TAL(p, json_strdup, &p->rpc_location));
-	if (err)
-		plugin_err(p, "cannot scan init params: %s: %.*s",
-			   err, json_tok_full_len(params),
-			   json_tok_full(buf, params));
+	configtok = json_delve(buf, params, ".configuration");
 
 	/* Move into lightning directory: other files are relative */
+	dirtok = json_delve(buf, configtok, ".lightning-dir");
+	dir = json_strdup(tmpctx, buf, dirtok);
 	if (chdir(dir) != 0)
 		plugin_err(p, "chdir to %s: %s", dir, strerror(errno));
 
+	nettok = json_delve(buf, configtok, ".network");
+	network = json_strdup(tmpctx, buf, nettok);
 	chainparams = chainparams_for_network(network);
 
-	/* Only attempt to connect if the plugin has configured the rpc_conn
-	 * already, if that's not the case we were told to run without an RPC
-	 * connection, so don't even log an error. */
-	/* FIXME: Move this to its own function so we can initialize at a
-	 * later point in time. */
-	if (p->rpc_conn != NULL) {
-		p->rpc_conn->fd = socket(AF_UNIX, SOCK_STREAM, 0);
-		if (strlen(p->rpc_location) + 1 > sizeof(addr.sun_path))
-			plugin_err(p, "rpc filename '%s' too long",
-				   p->rpc_location);
-		strcpy(addr.sun_path, p->rpc_location);
-		addr.sun_family = AF_UNIX;
+	fsettok = json_delve(buf, configtok, ".feature_set");
+	p->our_features = json_to_feature_set(p, buf, fsettok);
 
-		if (connect(p->rpc_conn->fd, (struct sockaddr *)&addr,
-			    sizeof(addr)) != 0) {
-			with_rpc = false;
-			plugin_log(p, LOG_UNUSUAL,
-				   "Could not connect to '%s': %s",
-				   p->rpc_location, strerror(errno));
-		}
+	rpctok = json_delve(buf, configtok, ".rpc-file");
+	p->rpc_conn->fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (rpctok->end - rpctok->start + 1 > sizeof(addr.sun_path))
+		plugin_err(p, "rpc filename '%.*s' too long",
+			   rpctok->end - rpctok->start,
+			   buf + rpctok->start);
+	memcpy(addr.sun_path, buf + rpctok->start, rpctok->end - rpctok->start);
+	addr.sun_path[rpctok->end - rpctok->start] = '\0';
+	addr.sun_family = AF_UNIX;
 
-		membuf_init(&p->rpc_conn->mb, tal_arr(p, char, READ_CHUNKSIZE),
-			    READ_CHUNKSIZE, membuf_tal_realloc);
-
+	if (connect(p->rpc_conn->fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+		with_rpc = false;
+		plugin_log(p, LOG_UNUSUAL, "Could not connect to '%.*s': %s",
+			   rpctok->end - rpctok->start, buf + rpctok->start,
+			   strerror(errno));
+	} else {
+		param_obj = json_out_obj(NULL, "config", "allow-deprecated-apis");
+		deprecated_apis = streq(rpc_delve(tmpctx, p, "listconfigs",
+						  take(param_obj),
+						  ".allow-deprecated-apis"),
+					"true");
 	}
 
 	opttok = json_get_member(buf, params, "options");
@@ -896,17 +820,13 @@ static struct command_result *handle_init(struct command *cmd,
 		tal_free(opt);
 	}
 
-	if (p->init) {
-		const char *disable = p->init(p, buf, configtok);
-		if (disable)
-			return command_success(cmd, json_out_obj(cmd, "disable",
-								 disable));
-	}
+	if (p->init)
+		p->init(p, buf, configtok);
 
 	if (with_rpc)
 		io_new_conn(p, p->rpc_conn->fd, rpc_conn_init, p);
 
-	return command_success(cmd, json_out_obj(cmd, NULL, NULL));
+	return command_success_str(cmd, NULL);
 }
 
 char *u64_option(const char *arg, u64 *i)
@@ -924,25 +844,6 @@ char *u64_option(const char *arg, u64 *i)
 }
 
 char *u32_option(const char *arg, u32 *i)
-{
-	char *endp;
-	u64 n;
-
-	errno = 0;
-	n = strtoul(arg, &endp, 0);
-	if (*endp || !arg[0])
-		return tal_fmt(NULL, "'%s' is not a number", arg);
-	if (errno)
-		return tal_fmt(NULL, "'%s' is out of range", arg);
-
-	*i = n;
-	if (*i != n)
-		return tal_fmt(NULL, "'%s' is too large (overflow)", arg);
-
-	return NULL;
-}
-
-char *u16_option(const char *arg, u16 *i)
 {
 	char *endp;
 	u64 n;
@@ -1024,7 +925,7 @@ struct plugin_timer *plugin_timer_(struct plugin *p, struct timerel t,
 				   void (*cb)(void *cb_arg),
 				   void *cb_arg)
 {
-	struct plugin_timer *timer = notleak(tal(NULL, struct plugin_timer));
+	struct plugin_timer *timer = tal(NULL, struct plugin_timer);
 	timer->cb = cb;
 	timer->cb_arg = cb_arg;
 	timer_init(&timer->timer);
@@ -1054,101 +955,6 @@ static void plugin_logv(struct plugin *p, enum log_level l,
 	jsonrpc_finish_and_send(p, js);
 }
 
-struct json_stream *plugin_notification_start(struct plugin *plugin,
-					      const char *method)
-{
-	struct json_stream *js = new_json_stream(plugin, NULL, NULL);
-
-	json_object_start(js, NULL);
-	json_add_string(js, "jsonrpc", "2.0");
-	json_add_string(js, "method", method);
-
-	json_object_start(js, "params");
-	return js;
-}
-void plugin_notification_end(struct plugin *plugin,
-			     struct json_stream *stream)
-{
-	json_object_end(stream);
-	jsonrpc_finish_and_send(plugin, stream);
-}
-
-struct json_stream *plugin_notify_start(struct command *cmd, const char *method)
-{
-	struct json_stream *js = new_json_stream(cmd, NULL, NULL);
-
-	json_object_start(js, NULL);
-	json_add_string(js, "jsonrpc", "2.0");
-	json_add_string(js, "method", method);
-
-	json_object_start(js, "params");
-	json_add_u64(js, "id", *cmd->id);
-
-	return js;
-}
-
-void plugin_notify_end(struct command *cmd, struct json_stream *js)
-{
-	json_object_end(js);
-
-	jsonrpc_finish_and_send(cmd->plugin, js);
-}
-
-/* Convenience wrapper for notify with "message" */
-void plugin_notify_message(struct command *cmd,
-			   enum log_level level,
-			   const char *fmt, ...)
-{
-	va_list ap;
-	struct json_stream *js;
-	const char *msg;
-
-	va_start(ap, fmt);
-	msg = tal_vfmt(tmpctx, fmt, ap);
-	va_end(ap);
-
-	/* Also log, debug level */
-	plugin_log(cmd->plugin, LOG_DBG, "notify msg %s: %s",
-		   log_level_name(level), msg);
-
-	js = plugin_notify_start(cmd, "message");
-	json_add_string(js, "level", log_level_name(level));
-
-	/* In case we're OOM */
-	if (js->jout)
-		json_out_addstr(js->jout, "message", msg);
-
-	plugin_notify_end(cmd, js);
-}
-
-void plugin_notify_progress(struct command *cmd,
-			    u32 num_stages, u32 stage,
-			    u32 num_progress, u32 progress)
-{
-	struct json_stream *js = plugin_notify_start(cmd, "progress");
-
-	assert(progress < num_progress);
-	json_add_u32(js, "num", progress);
-	json_add_u32(js, "total", num_progress);
-	if (num_stages > 0) {
-		assert(stage < num_stages);
-		json_object_start(js, "stage");
-		json_add_u32(js, "num", stage);
-		json_add_u32(js, "total", num_stages);
-		json_object_end(js);
-	}
-	plugin_notify_end(cmd, js);
-}
-
-void NORETURN plugin_exit(struct plugin *p, int exitcode)
-{
-	p->exiting = true;
-	io_conn_out_exclusive(p->stdout_conn, true);
-	io_wake(p);
-	io_loop(NULL, NULL);
-	exit(exitcode);
-}
-
 void NORETURN plugin_err(struct plugin *p, const char *fmt, ...)
 {
 	va_list ap;
@@ -1157,10 +963,8 @@ void NORETURN plugin_err(struct plugin *p, const char *fmt, ...)
 	plugin_logv(p, LOG_BROKEN, fmt, ap);
 	va_end(ap);
 	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
-	fprintf(stderr, "\n");
+	errx(1, "%s", tal_vfmt(NULL, fmt, ap));
 	va_end(ap);
-	plugin_exit(p, 1);
 }
 
 void plugin_log(struct plugin *p, enum log_level l, const char *fmt, ...)
@@ -1172,50 +976,11 @@ void plugin_log(struct plugin *p, enum log_level l, const char *fmt, ...)
 	va_end(ap);
 }
 
-#if DEVELOPER
-/* Hack since we have no extra ptr to log_memleak */
-static struct plugin *memleak_plugin;
-static void PRINTF_FMT(1,2) log_memleak(const char *fmt, ...)
-{
-	va_list ap;
-
-	va_start(ap, fmt);
-	plugin_logv(memleak_plugin, LOG_BROKEN, fmt, ap);
-	va_end(ap);
-}
-
-static void memleak_check(struct plugin *plugin, struct command *cmd)
-{
-	struct htable *memtable;
-
-	memtable = memleak_find_allocations(tmpctx, cmd, cmd);
-
-	/* Now delete plugin and anything it has pointers to. */
-	memleak_remove_region(memtable, plugin, sizeof(*plugin));
-
-	/* We know usage strings are referred to. */
-	memleak_remove_strmap(memtable, &cmd->plugin->usagemap);
-
-	if (plugin->mark_mem)
-		plugin->mark_mem(plugin, memtable);
-
-	memleak_plugin = plugin;
-	dump_memleak(memtable, log_memleak);
-}
-
-void plugin_set_memleak_handler(struct plugin *plugin,
-				void (*mark_mem)(struct plugin *plugin,
-						 struct htable *memtable))
-{
-	plugin->mark_mem = mark_mem;
-}
-#endif /* DEVELOPER */
-
 static void ld_command_handle(struct plugin *plugin,
+			      struct command *cmd,
 			      const jsmntok_t *toks)
 {
 	const jsmntok_t *idtok, *methtok, *paramstok;
-	struct command *cmd;
 
 	idtok = json_get_member(plugin->buffer, toks, "id");
 	methtok = json_get_member(plugin->buffer, toks, "method");
@@ -1227,7 +992,6 @@ static void ld_command_handle(struct plugin *plugin,
 			   json_tok_full_len(toks),
 			   json_tok_full(plugin->buffer, toks));
 
-	cmd = tal(plugin, struct command);
 	cmd->plugin = plugin;
 	cmd->id = NULL;
 	cmd->usage_only = false;
@@ -1242,7 +1006,7 @@ static void ld_command_handle(struct plugin *plugin,
 
 	if (!plugin->manifested) {
 		if (streq(cmd->methodname, "getmanifest")) {
-			handle_getmanifest(cmd, plugin->buffer, paramstok);
+			handle_getmanifest(cmd);
 			plugin->manifested = true;
 			return;
 		}
@@ -1262,11 +1026,6 @@ static void ld_command_handle(struct plugin *plugin,
 
 	/* If that's a notification. */
 	if (!cmd->id) {
-#if DEVELOPER
-		bool is_shutdown = streq(cmd->methodname, "shutdown");
-		if (is_shutdown)
-			memleak_check(plugin, cmd);
-#endif
 		for (size_t i = 0; i < plugin->num_notif_subs; i++) {
 			if (streq(cmd->methodname,
 				  plugin->notif_subs[i].name)) {
@@ -1276,13 +1035,6 @@ static void ld_command_handle(struct plugin *plugin,
 				return;
 			}
 		}
-
-#if DEVELOPER
-		/* We subscribe them to this always */
-		if (is_shutdown)
-			plugin_exit(plugin, 0);
-#endif
-
 		plugin_err(plugin, "Unregistered notification %.*s",
 			   json_tok_full_len(methtok),
 			   json_tok_full(plugin->buffer, methtok));
@@ -1315,39 +1067,40 @@ static void ld_command_handle(struct plugin *plugin,
  */
 static bool ld_read_json_one(struct plugin *plugin)
 {
-	bool complete;
+	bool valid;
+	const jsmntok_t *toks;
+	struct command *cmd = tal(plugin, struct command);
 
-	if (!json_parse_input(&plugin->parser, &plugin->toks,
-			      plugin->buffer, plugin->used,
-			      &complete)) {
-		plugin_err(plugin, "Failed to parse JSON response '%.*s'",
-			   (int)plugin->used, plugin->buffer);
-		return false;
-	}
-
-	if (!complete) {
+	/* FIXME: This could be done more efficiently by storing the
+	 * toks and doing an incremental parse, like lightning-cli
+	 * does. */
+	toks = json_parse_input(NULL, plugin->buffer, plugin->used,
+				&valid);
+	if (!toks) {
+		if (!valid) {
+			plugin_err(plugin, "Failed to parse JSON response '%.*s'",
+				   (int)plugin->used, plugin->buffer);
+			return false;
+		}
 		/* We need more. */
 		return false;
 	}
 
 	/* Empty buffer? (eg. just whitespace). */
-	if (tal_count(plugin->toks) == 1) {
-		toks_reset(plugin->toks);
-		jsmn_init(&plugin->parser);
+	if (tal_count(toks) == 1) {
 		plugin->used = 0;
 		return false;
 	}
 
 	/* FIXME: Spark doesn't create proper jsonrpc 2.0!  So we don't
 	 * check for "jsonrpc" here. */
-	ld_command_handle(plugin, plugin->toks);
+	ld_command_handle(plugin, cmd, toks);
 
 	/* Move this object out of the buffer */
-	memmove(plugin->buffer, plugin->buffer + plugin->toks[0].end,
-		tal_count(plugin->buffer) - plugin->toks[0].end);
-	plugin->used -= plugin->toks[0].end;
-	toks_reset(plugin->toks);
-	jsmn_init(&plugin->parser);
+	memmove(plugin->buffer, plugin->buffer + toks[0].end,
+		tal_count(plugin->buffer) - toks[0].end);
+	plugin->used -= toks[0].end;
+	tal_free(toks);
 
 	return true;
 }
@@ -1394,9 +1147,6 @@ static struct io_plan *ld_write_json(struct io_conn *conn,
 		return json_stream_output(plugin->js_arr[0], plugin->stdout_conn,
 					  ld_stream_complete, plugin);
 
-	/* If we were simply flushing final output, stop now. */
-	if (plugin->exiting)
-		io_break(plugin);
 	return io_out_wait(conn, plugin, ld_write_json, plugin);
 }
 
@@ -1429,20 +1179,16 @@ static struct io_plan *stdout_conn_init(struct io_conn *conn,
 }
 
 static struct plugin *new_plugin(const tal_t *ctx,
-				 const char *(*init)(struct plugin *p,
-						     const char *buf,
-						     const jsmntok_t *),
+				 void (*init)(struct plugin *p,
+					      const char *buf, const jsmntok_t *),
 				 const enum plugin_restartability restartability,
-				 bool init_rpc,
-				 struct feature_set *features STEALS,
-				 const struct plugin_command *commands TAKES,
+				 struct feature_set *features,
+				 const struct plugin_command *commands,
 				 size_t num_commands,
-				 const struct plugin_notification *notif_subs TAKES,
+				 const struct plugin_notification *notif_subs,
 				 size_t num_notif_subs,
-				 const struct plugin_hook *hook_subs TAKES,
+				 const struct plugin_hook *hook_subs,
 				 size_t num_hook_subs,
-				 const char **notif_topics TAKES,
-				 size_t num_notif_topics,
 				 va_list ap)
 {
 	const char *optname;
@@ -1452,47 +1198,32 @@ static struct plugin *new_plugin(const tal_t *ctx,
 	p->js_arr = tal_arr(p, struct json_stream *, 0);
 	p->used = 0;
 	p->len_read = 0;
-	jsmn_init(&p->parser);
-	p->toks = toks_alloc(p);
 	/* Async RPC */
 	p->rpc_buffer = tal_arr(p, char, 64);
 	p->rpc_js_arr = tal_arr(p, struct json_stream *, 0);
 	p->rpc_used = 0;
 	p->rpc_len_read = 0;
-	jsmn_init(&p->rpc_parser);
-	p->rpc_toks = toks_alloc(p);
 	p->next_outreq_id = 0;
 	uintmap_init(&p->out_reqs);
 
-	p->our_features = tal_steal(p, features);
-	if (init_rpc) {
-		/* Sync RPC FIXME: maybe go full async ? */
-		p->rpc_conn = tal(p, struct rpc_conn);
-	} else {
-		p->rpc_conn = NULL;
-	}
+	p->our_features = features;
+	/* Sync RPC FIXME: maybe go full async ? */
+	p->rpc_conn = tal(p, struct rpc_conn);
+	membuf_init(&p->rpc_conn->mb,
+		    tal_arr(p, char, READ_CHUNKSIZE), READ_CHUNKSIZE,
+		    membuf_tal_realloc);
 
 	p->init = init;
-	p->manifested = p->initialized = p->exiting = false;
+	p->manifested = p->initialized = false;
 	p->restartability = restartability;
 	strmap_init(&p->usagemap);
 	p->in_timer = 0;
 
 	p->commands = commands;
-	if (taken(commands))
-		tal_steal(p, commands);
 	p->num_commands = num_commands;
-	p->notif_topics = notif_topics;
-	if (taken(notif_topics))
-		tal_steal(p, notif_topics);
-	p->num_notif_topics = num_notif_topics;
 	p->notif_subs = notif_subs;
-	if (taken(notif_subs))
-		tal_steal(p, notif_subs);
 	p->num_notif_subs = num_notif_subs;
 	p->hook_subs = hook_subs;
-	if (taken(hook_subs))
-		tal_steal(p, hook_subs);
 	p->num_hook_subs = num_hook_subs;
 	p->opts = tal_arr(p, struct plugin_option, 0);
 
@@ -1503,30 +1234,23 @@ static struct plugin *new_plugin(const tal_t *ctx,
 		o.description = va_arg(ap, const char *);
 		o.handle = va_arg(ap, char *(*)(const char *str, void *arg));
 		o.arg = va_arg(ap, void *);
-		o.deprecated = va_arg(ap, int); /* bool gets promoted! */
 		tal_arr_expand(&p->opts, o);
 	}
 
-#if DEVELOPER
-	p->mark_mem = NULL;
-#endif
 	return p;
 }
 
 void plugin_main(char *argv[],
-		 const char *(*init)(struct plugin *p,
-				     const char *buf, const jsmntok_t *),
+		 void (*init)(struct plugin *p,
+			      const char *buf, const jsmntok_t *),
 		 const enum plugin_restartability restartability,
-		 bool init_rpc,
-		 struct feature_set *features STEALS,
-		 const struct plugin_command *commands TAKES,
+		 struct feature_set *features,
+		 const struct plugin_command *commands,
 		 size_t num_commands,
-		 const struct plugin_notification *notif_subs TAKES,
+		 const struct plugin_notification *notif_subs,
 		 size_t num_notif_subs,
-		 const struct plugin_hook *hook_subs TAKES,
+		 const struct plugin_hook *hook_subs,
 		 size_t num_hook_subs,
-		 const char **notif_topics TAKES,
-		 size_t num_notif_topics,
 		 ...)
 {
 	struct plugin *plugin;
@@ -1539,10 +1263,10 @@ void plugin_main(char *argv[],
 	/* Note this already prints to stderr, which is enough for now */
 	daemon_setup(argv[0], NULL, NULL);
 
-	va_start(ap, num_notif_topics);
-	plugin = new_plugin(NULL, init, restartability, init_rpc, features, commands,
+	va_start(ap, num_hook_subs);
+	plugin = new_plugin(NULL, init, restartability, features, commands,
 			    num_commands, notif_subs, num_notif_subs, hook_subs,
-			    num_hook_subs, notif_topics, num_notif_topics, ap);
+			    num_hook_subs, ap);
 	va_end(ap);
 	setup_command_usage(plugin);
 
@@ -1725,8 +1449,8 @@ static bool json_to_route_hop_inplace(struct route_hop *dst, const char *buffer,
 	    amounttok == NULL || delaytok == NULL || styletok == NULL)
 		return false;
 
-	json_to_node_id(buffer, idtok, &dst->node_id);
-	json_to_short_channel_id(buffer, channeltok, &dst->scid);
+	json_to_node_id(buffer, idtok, &dst->nodeid);
+	json_to_short_channel_id(buffer, channeltok, &dst->channel_id);
 	json_to_int(buffer, directiontok, &dst->direction);
 	json_to_msat(buffer, amounttok, &dst->amount);
 	json_to_number(buffer, delaytok, &dst->delay);
@@ -1751,19 +1475,4 @@ struct route_hop *json_to_route(const tal_t *ctx, const char *buffer,
 			return tal_free(hops);
 	}
 	return hops;
-}
-
-struct command_result *WARN_UNUSED_RESULT
-command_hook_success(struct command *cmd)
-{
-	struct json_stream *response = jsonrpc_stream_success(cmd);
-	json_add_string(response, "result", "continue");
-	return command_finished(cmd, response);
-}
-
-struct command_result *WARN_UNUSED_RESULT
-notification_handled(struct command *cmd)
-{
-	tal_free(cmd);
-	return &complete;
 }

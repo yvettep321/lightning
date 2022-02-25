@@ -3,9 +3,8 @@
 #include "config.h"
 
 #include <common/bolt11.h>
-#include <common/route.h>
 #include <plugins/libplugin.h>
-#include <wire/onion_wire.h>
+#include <wire/gen_onion_wire.h>
 
 struct legacy_payload {
 	struct short_channel_id scid;
@@ -30,9 +29,9 @@ struct createonion_request {
 
 /* States returned by listsendpays, waitsendpay, etc. */
 enum payment_result_state {
-	PAYMENT_PENDING = 1,
-	PAYMENT_COMPLETE = 2,
-	PAYMENT_FAILED = 4,
+	PAYMENT_PENDING,
+	PAYMENT_COMPLETE,
+	PAYMENT_FAILED,
 };
 
 /* A parsed version of the possible outcomes that a sendpay / payment may
@@ -47,7 +46,7 @@ struct payment_result {
 	struct preimage *payment_preimage;
 	u32 code;
 	const char* failcodename;
-	enum onion_wire failcode;
+	enum onion_type failcode;
 	const u8 *raw_message;
 	const char *message;
 	u32 *erring_index;
@@ -70,14 +69,6 @@ struct channel_hint {
 
 	/* Is the channel enabled? */
 	bool enabled;
-
-	/* True if we are one endpoint of this channel */
-	bool local;
-
-	/* How many more htlcs can we send over this channel? Only set if this
-	 * is a local channel, because those are the channels we have exact
-	 * numbers on, and they are the bottleneck onto the network. */
-	u16 htlc_budget;
 };
 
 /* Each payment goes through a number of steps that are always processed in
@@ -94,11 +85,6 @@ enum payment_step {
 	/* We just called getroute and got a resulting route, allow modifiers
 	 * to amend the route. */
 	PAYMENT_STEP_GOT_ROUTE = 2,
-
-	/* Something went wrong with the route returned by the
-	previous step, so retry, but do not rerun the INITIALIZED
-	modifiers. */
-	PAYMENT_STEP_RETRY_GETROUTE = 3,
 
 	/* We just computed the onion payload, allow modifiers to amend,
 	 * before constructing the onion packet. */
@@ -175,8 +161,6 @@ struct payment {
 
 	/* Real destination we want to route to */
 	struct node_id *destination;
-	/* Do we know for sure that this supports OPT_VAR_ONION? */
-	bool destination_has_tlv;
 
 	/* Payment hash extracted from the invoice if any. */
 	struct sha256 *payment_hash;
@@ -184,7 +168,6 @@ struct payment {
 	/* Payment secret, from the invoice if any. */
 	struct secret *payment_secret;
 
-	u64 groupid;
 	u32 partid;
 	u32 next_partid;
 
@@ -234,18 +217,12 @@ struct payment {
 	void **modifier_data;
 	int current_modifier;
 
-	/* Information from the invoice. */
-	u32 min_final_cltv_expiry;
-	struct route_info **routes;
-	const u8 *features;
+	struct bolt11 *invoice;
 
 	/* tal_arr of channel_hints we incrementally learn while performing
 	 * payment attempts. */
 	struct channel_hint *channel_hints;
 	struct node_id *excluded_nodes;
-
-	/* Optional temporarily excluded channels/nodes (i.e. this routehint) */
-	struct node_id *temp_exclusion;
 
 	struct payment_result *result;
 
@@ -256,13 +233,9 @@ struct payment {
 	 * true. Set only on the root payment. */
 	bool abort;
 
-	/* Serialized bolt11/12 string, kept attachd to the root so we can filter
+	/* Serialized bolt11 string, kept attachd to the root so we can filter
 	 * by the invoice. */
-	const char *invstring;
-
-	/* If this is paying a local offer, this is the one (sendpay ensures we
-	 * don't pay twice for single-use offers) */
-	struct sha256 *local_offer_id;
+	const char *bolt11;
 
 	/* Textual explanation of why this payment was attempted. */
 	const char *why;
@@ -271,38 +244,6 @@ struct payment {
 
 	/* Human readable explanation of why this payment failed. */
 	const char *failreason;
-
-	/* If a failed getroute call can be retried for this payment. Allows
-	 * us for example to signal to any retry modifier that we can retry
-	 * despite getroute not returning a usable route. This can be the case
-	 * if we switch any of the parameters such as destination or
-	 * amount. */
-	bool failroute_retry;
-
-	/* A unique id for the root of this payment.  */
-	u64 id;
-
-	/* A short description of the route of this payment.  */
-	char *routetxt;
-
-	/* The maximum number of parallel outgoing HTLCs we will allow.
-	 * If unset, the maximum is based on the number of outgoing HTLCs.
-	 * This only applies for the root payment, and is ignored on non-root
-	 * payments.
-	 * Clients of the paymod system MUST NOT modify it, and individual
-	 * paymods MUST interact with it only via the payment_max_htlcs
-	 * and payment_lower_max_htlcs functions.
-	 */
-	u32 max_htlcs;
-
-	/* A human readable error message that is used as a top-level
-	 * explanation if a payment is aborted. */
-	char *aborterror;
-
-	/* Callback to be called when the entire payment process
-	 * completes successfully. */
-	void (*on_payment_success)(struct payment *p);
-	void (*on_payment_failure)(struct payment *p);
 };
 
 struct payment_modifier {
@@ -341,33 +282,15 @@ struct routehints_data {
 	/* What we did about routehints (if anything) */
 	const char *routehint_modifications;
 
-	/* Array of routehints to try. */
+	/* Any remaining routehints to try. */
 	struct route_info **routehints;
 
 	/* Current routehint, if any. */
 	struct route_info *current_routehint;
 
-	/* Position of the current routehint in the routehints
-	 * array. Inherited on retry (and possibly incremented),
-	 * reset to 0 on split. */
-	int offset;
-	/* Base of the current routehint.
-	 * This is randomized to start routehints at a random point
-	 * on each split, to reduce the chances of multiple splits
-	 * going to the same routehint.
-	 * The sum of base + offset is used as the index into the
-	 * routehints array (wraps around).
-	 * offset is used to determine if we have run out of
-	 * routehints, base is used for randomization.
-	 */
-	int base;
-
 	/* We modify the CLTV in the getroute call, so we need to remember
 	 * what the final cltv delta was so we re-apply it correctly. */
 	u32 final_cltv;
-
-	/* Is the destination reachable without any routehints? */
-	bool destination_reachable;
 };
 
 struct exemptfee_data {
@@ -397,17 +320,11 @@ struct direct_pay_data {
 	struct short_channel_id_dir *chan;
 };
 
+/* Since presplit and adaptive mpp modifiers share the same information we
+ * just use the same backing struct. Should they deviate we can create an
+ * adaptive_splitter_mod_data struct and populate that. */
 struct presplit_mod_data {
 	bool disable;
-};
-
-struct adaptive_split_mod_data {
-	bool disable;
-	u32 htlc_budget;
-};
-
-struct route_exclusions_data {
-	struct route_exclusion **exclusions;
 };
 
 /* List of globally available payment modifiers. */
@@ -418,20 +335,13 @@ REGISTER_PAYMENT_MODIFIER_HEADER(shadowroute, struct shadow_route_data);
 REGISTER_PAYMENT_MODIFIER_HEADER(directpay, struct direct_pay_data);
 extern struct payment_modifier waitblockheight_pay_mod;
 REGISTER_PAYMENT_MODIFIER_HEADER(presplit, struct presplit_mod_data);
-REGISTER_PAYMENT_MODIFIER_HEADER(adaptive_splitter, struct adaptive_split_mod_data);
+REGISTER_PAYMENT_MODIFIER_HEADER(adaptive_splitter, struct presplit_mod_data);
 
 /* For the root payment we can seed the channel_hints with the result from
  * `listpeers`, hence avoid channels that we know have insufficient capacity
  * or are disabled. We do this only for the root payment, to minimize the
  * overhead. */
 REGISTER_PAYMENT_MODIFIER_HEADER(local_channel_hints, void);
-/* The payee might be less well-connected than ourselves.
- * This paymod limits the number of HTLCs based on the number of channels
- * we detect the payee to have, in order to not exhaust the number of HTLCs
- * each of those channels can bear.  */
-REGISTER_PAYMENT_MODIFIER_HEADER(payee_incoming_limit, void);
-REGISTER_PAYMENT_MODIFIER_HEADER(route_exclusions, struct route_exclusions_data);
-
 
 struct payment *payment_new(tal_t *ctx, struct command *cmd,
 			    struct payment *parent,
@@ -453,17 +363,7 @@ void payment_set_step(struct payment *p, enum payment_step newstep);
 /* Fails a partial payment and continues with the core flow. */
 void payment_fail(struct payment *p, const char *fmt, ...) PRINTF_FMT(2,3);
 
-/* Fails a payment process by setting the root payment to
- * aborted. This will cause all subpayments to terminate as soon as
- * they can, and sets the root failreason so we have a sensible error
- * message. The failreason is overwritten if it is already set, since
- * we probably know better what happened in the modifier.. */
-void payment_abort(struct payment *p, const char *fmt, ...) PRINTF_FMT(2,3);
-
 struct payment *payment_root(struct payment *p);
 struct payment_tree_result payment_collect_result(struct payment *p);
-
-/* For special effects, like inspecting your own routes. */
-struct gossmap *get_gossmap(struct plugin *plugin);
 
 #endif /* LIGHTNING_PLUGINS_LIBPLUGIN_PAY_H */

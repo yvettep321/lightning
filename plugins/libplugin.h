@@ -14,10 +14,8 @@
 #include <common/json_command.h>
 #include <common/json_helpers.h>
 #include <common/jsonrpc_errors.h>
-#include <common/node_id.h>
 #include <common/param.h>
 #include <common/status_levels.h>
-#include <common/utils.h>
 
 struct json_out;
 struct plugin;
@@ -66,8 +64,6 @@ struct plugin_command {
 	struct command_result *(*handle)(struct command *cmd,
 					 const char *buf,
 					 const jsmntok_t *params);
-	/* If true, this command *disabled* if allow-deprecated-apis = false */
-	bool deprecated;
 };
 
 /* Create an array of these, one for each --option you support. */
@@ -77,18 +73,14 @@ struct plugin_option {
 	const char *description;
 	char *(*handle)(const char *str, void *arg);
 	void *arg;
-	/* If true, this options *disabled* if allow-deprecated-apis = false */
-	bool deprecated;
 };
 
 /* Create an array of these, one for each notification you subscribe to. */
 struct plugin_notification {
 	const char *name;
-	/* The handler must eventually trigger a `notification_handled`
-	 * call.  */
-	struct command_result* (*handle)(struct command *cmd,
-					 const char *buf,
-					 const jsmntok_t *params);
+	void (*handle)(struct command *cmd,
+	               const char *buf,
+	               const jsmntok_t *params);
 };
 
 /* Create an array of these, one for each hook you subscribe to. */
@@ -97,26 +89,24 @@ struct plugin_hook {
 	struct command_result *(*handle)(struct command *cmd,
 	                                 const char *buf,
 	                                 const jsmntok_t *params);
-	/* If non-NULL, these are NULL-terminated arrays of deps */
-	const char **before, **after;
 };
 
 /* Return the feature set of the current lightning node */
 const struct feature_set *plugin_feature_set(const struct plugin *p);
 
 /* Helper to create a JSONRPC2 request stream. Send it with `send_outreq`. */
-struct out_req *jsonrpc_request_start_(struct plugin *plugin,
-				       struct command *cmd,
-				       const char *method,
-				       struct command_result *(*cb)(struct command *command,
-								    const char *buf,
-								    const jsmntok_t *result,
-								    void *arg),
-				       struct command_result *(*errcb)(struct command *command,
-								       const char *buf,
-								       const jsmntok_t *result,
-								       void *arg),
-				       void *arg);
+struct out_req *
+jsonrpc_request_start_(struct plugin *plugin, struct command *cmd,
+		       const char *method,
+		       struct command_result *(*cb)(struct command *command,
+						    const char *buf,
+						    const jsmntok_t *result,
+						    void *arg),
+		       struct command_result *(*errcb)(struct command *command,
+						       const char *buf,
+						       const jsmntok_t *result,
+						       void *arg),
+		       void *arg);
 
 #define jsonrpc_request_start(plugin, cmd, method, cb, errcb, arg)	\
 	jsonrpc_request_start_((plugin), (cmd), (method),		\
@@ -149,12 +139,12 @@ struct json_stream *jsonrpc_stream_fail_data(struct command *cmd,
 
 /* This command is finished, here's the response (the content of the
  * "result" or "error" field) */
-WARN_UNUSED_RESULT
-struct command_result *command_finished(struct command *cmd, struct json_stream *response);
+struct command_result *WARN_UNUSED_RESULT
+command_finished(struct command *cmd, struct json_stream *response);
 
 /* Helper for a command that'll be finished in a callback. */
-WARN_UNUSED_RESULT
-struct command_result *command_still_pending(struct command *cmd);
+struct command_result *WARN_UNUSED_RESULT
+command_still_pending(struct command *cmd);
 
 /* Helper to create a zero or single-value JSON object; if @str is NULL,
  * object is empty. */
@@ -167,9 +157,6 @@ struct command_result *command_param_failed(void);
 
 /* Call this on fatal error. */
 void NORETURN plugin_err(struct plugin *p, const char *fmt, ...);
-
-/* Normal exit (makes sure to flush output!). */
-void NORETURN plugin_exit(struct plugin *p, int exitcode);
 
 /* This command is finished, here's a detailed error; @cmd cannot be
  * NULL, data can be NULL; otherwise it must be a JSON object. */
@@ -188,28 +175,22 @@ struct command_result *command_err_raw(struct command *cmd,
 struct command_result *WARN_UNUSED_RESULT
 command_success(struct command *cmd, const struct json_out *result);
 
-/* End a hook normally (with "result": "continue") */
+/* Simple version where we just want to send a string, or NULL means an empty
+ * result object.  @cmd cannot be NULL. */
 struct command_result *WARN_UNUSED_RESULT
-command_hook_success(struct command *cmd);
+command_success_str(struct command *cmd, const char *str);
 
-/* End a notification handler.  */
-struct command_result *WARN_UNUSED_RESULT
-notification_handled(struct command *cmd);
-
-/* Helper for notification handler that will be finished in a callback.  */
-#define notification_handler_pending(cmd) command_still_pending(cmd)
-
-/* Synchronous helper to send command and extract fields from
+/* Synchronous helper to send command and extract single field from
  * response; can only be used in init callback. */
-void rpc_scan(struct plugin *plugin,
-	      const char *method,
-	      const struct json_out *params TAKES,
-	      const char *guide,
-	      ...);
+const char *rpc_delve(const tal_t *ctx,
+		      struct plugin *plugin,
+		      const char *method,
+		      const struct json_out *params TAKES,
+		      const char *guide);
 
 /* Send an async rpc request to lightningd. */
-struct command_result *send_outreq(struct plugin *plugin,
-				   const struct out_req *req);
+struct command_result *
+send_outreq(struct plugin *plugin, const struct out_req *req);
 
 /* Callback to just forward error and close request; @cmd cannot be NULL */
 struct command_result *forward_error(struct command *cmd,
@@ -227,10 +208,6 @@ struct command_result *forward_result(struct command *cmd,
  * must return this eventually, though they may do so via a convoluted
  * send_req() path. */
 struct command_result *timer_complete(struct plugin *p);
-
-/* Signals that we've completed a command. Useful for when
- * there's no `cmd` present */
-struct command_result *command_done(void);
 
 /* Access timer infrastructure to add a timer.
  *
@@ -251,67 +228,33 @@ struct plugin_timer *plugin_timer_(struct plugin *p,
 /* Log something */
 void plugin_log(struct plugin *p, enum log_level l, const char *fmt, ...) PRINTF_FMT(3, 4);
 
-/* Notify the caller of something. */
-struct json_stream *plugin_notify_start(struct command *cmd, const char *method);
-void plugin_notify_end(struct command *cmd, struct json_stream *js);
-
-/* Send a notification for a custom notification topic. These are sent
- * to lightningd and distributed to subscribing plugins. */
-struct json_stream *plugin_notification_start(struct plugin *plugins,
-					      const char *method);
-void plugin_notification_end(struct plugin *plugin,
-			     struct json_stream *stream TAKES);
-
-/* Convenience wrapper for notify "message" */
-void plugin_notify_message(struct command *cmd,
-			   enum log_level level,
-			   const char *fmt, ...)
-	PRINTF_FMT(3, 4);
-
-/* Convenience wrapper for progress: num_stages is normally 0. */
-void plugin_notify_progress(struct command *cmd,
-			    u32 num_stages, u32 stage,
-			    u32 num_progress, u32 progress);
-
 /* Macro to define arguments */
-#define plugin_option_(name, type, description, set, arg, deprecated)	\
+#define plugin_option(name, type, description, set, arg)			\
 	(name),								\
 	(type),								\
 	(description),							\
 	typesafe_cb_preargs(char *, void *, (set), (arg), const char *),	\
-	(arg),								\
-	(deprecated)
-
-#define plugin_option(name, type, description, set, arg) \
-	plugin_option_((name), (type), (description), (set), (arg), false)
-
-#define plugin_option_deprecated(name, type, description, set, arg) \
-	plugin_option_((name), (type), (description), (set), (arg), true)
+	(arg)
 
 /* Standard helpers */
 char *u64_option(const char *arg, u64 *i);
 char *u32_option(const char *arg, u32 *i);
-char *u16_option(const char *arg, u16 *i);
 char *bool_option(const char *arg, bool *i);
 char *charp_option(const char *arg, char **p);
 char *flag_option(const char *arg, bool *i);
 
 /* The main plugin runner: append with 0 or more plugin_option(), then NULL. */
 void NORETURN LAST_ARG_NULL plugin_main(char *argv[],
-					const char *(*init)(struct plugin *p,
-							    const char *buf,
-							    const jsmntok_t *),
+					void (*init)(struct plugin *p,
+						     const char *buf, const jsmntok_t *),
 					const enum plugin_restartability restartability,
-					bool init_rpc,
-					struct feature_set *features STEALS,
-					const struct plugin_command *commands TAKES,
+					struct feature_set *features,
+					const struct plugin_command *commands,
 					size_t num_commands,
-					const struct plugin_notification *notif_subs TAKES,
+					const struct plugin_notification *notif_subs,
 					size_t num_notif_subs,
-					const struct plugin_hook *hook_subs TAKES,
+					const struct plugin_hook *hook_subs,
 					size_t num_hook_subs,
-					const char **notif_topics TAKES,
-					size_t num_notif_topics,
 					...);
 
 struct listpeers_channel {
@@ -350,14 +293,22 @@ struct createonion_response *json_to_createonion_response(const tal_t *ctx,
 							  const char *buffer,
 							  const jsmntok_t *toks);
 
+enum route_hop_style {
+	ROUTE_HOP_LEGACY = 1,
+	ROUTE_HOP_TLV = 2,
+};
+
+struct route_hop {
+	struct short_channel_id channel_id;
+	int direction;
+	struct node_id nodeid;
+	struct amount_msat amount;
+	u32 delay;
+	struct pubkey *blinding;
+	enum route_hop_style style;
+};
+
 struct route_hop *json_to_route(const tal_t *ctx, const char *buffer,
 				const jsmntok_t *toks);
-
-#if DEVELOPER
-struct htable;
-void plugin_set_memleak_handler(struct plugin *plugin,
-				void (*mark_mem)(struct plugin *plugin,
-						 struct htable *memtable));
-#endif /* DEVELOPER */
 
 #endif /* LIGHTNING_PLUGINS_LIBPLUGIN_H */

@@ -1,10 +1,8 @@
-#include "config.h"
-#include <common/features.h>
 #include <common/timeout.h>
-#include <common/type_to_string.h>
+#include <lightningd/htlc_end.h>
 #include <lightningd/htlc_set.h>
-#include <lightningd/invoice.h>
 #include <lightningd/lightningd.h>
+#include <lightningd/peer_htlcs.h>
 
 /* If an HTLC times out, we need to free entire set, since we could be processing
  * it in invoice.c right now. */
@@ -116,17 +114,6 @@ void htlc_set_add(struct lightningd *ld,
 		return;
 	}
 
-	/* If we insist on a payment secret, it must always have it */
-	if (feature_is_set(details->features, COMPULSORY_FEATURE(OPT_PAYMENT_SECRET))
-	    && !payment_secret) {
-		log_debug(ld->log, "Missing payment_secret, but required for %s",
-			  type_to_string(tmpctx, struct sha256,
-					 &hin->payment_hash));
-		local_fail_in_htlc(hin,
-				   take(failmsg_incorrect_or_unknown(NULL, ld, hin)));
-		return;
-	}
-
 	/* BOLT #4:
 	 *  - otherwise, if it supports `basic_mpp`:
 	 *    - MUST add it to the HTLC set corresponding to that `payment_hash`.
@@ -195,11 +182,10 @@ void htlc_set_add(struct lightningd *ld,
 	}
 
 	log_debug(ld->log,
-		  "HTLC set contains %zu HTLCs, for a total of %s out of %s (%spayment_secret)",
+		  "HTLC set contains %zu HTLCs, for a total of %s out of %s",
 		  tal_count(set->htlcs),
 		  type_to_string(tmpctx, struct amount_msat, &set->so_far),
-		  type_to_string(tmpctx, struct amount_msat, &total_msat),
-		  payment_secret ? "" : "no "
+		  type_to_string(tmpctx, struct amount_msat, &total_msat)
 		);
 
 	if (amount_msat_eq(set->so_far, total_msat)) {

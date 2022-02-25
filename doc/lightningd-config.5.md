@@ -46,25 +46,22 @@ OPTIONS
  **allow-deprecated-apis**=*BOOL*
 Enable deprecated options, JSONRPC commands, fields, etc. It defaults to
 *true*, but you should set it to *false* when testing to ensure that an
-upgrade won't break your configuration.
+upgrade won’t break your configuration.
 
  **help**
 Print help and exit. Not very useful inside a configuration file, but
-fun to put in other's config files while their computer is unattended.
+fun to put in other’s config files while their computer is unattended.
 
  **version**
 Print version and exit. Also useless inside a configuration file, but
-putting this in someone's config file may convince them to read this man
+putting this in someone’s config file may convince them to read this man
 page.
 
 Bitcoin control options:
 
  **network**=*NETWORK*
-Select the network parameters (*bitcoin*, *testnet*, *signet*, or *regtest*).
+Select the network parameters (*bitcoin*, *testnet*, or *regtest*).
 This is not valid within the per-network configuration file.
-
- **mainnet**
-Alias for *network=bitcoin*.
 
  **testnet**
 Alias for *network=testnet*.
@@ -72,25 +69,28 @@ Alias for *network=testnet*.
  **signet**
 Alias for *network=signet*.
 
- **bitcoin-cli**=*PATH* [plugin `bcli`]
+ **mainnet**
+Alias for *network=bitcoin*.
+
+ **bitcoin-cli**=*PATH*
 The name of *bitcoin-cli* executable to run.
 
- **bitcoin-datadir**=*DIR* [plugin `bcli`]
+ **bitcoin-datadir**=*DIR*
 *-datadir* argument to supply to bitcoin-cli(1).
 
- **bitcoin-rpcuser**=*USER* [plugin `bcli`]
+ **bitcoin-rpcuser**=*USER*
 The RPC username for talking to bitcoind(1).
 
- **bitcoin-rpcpassword**=*PASSWORD* [plugin `bcli`]
+ **bitcoin-rpcpassword**=*PASSWORD*
 The RPC password for talking to bitcoind(1).
 
- **bitcoin-rpcconnect**=*HOST* [plugin `bcli`]
+ **bitcoin-rpcconnect**=*HOST*
 The bitcoind(1) RPC host to connect to.
 
- **bitcoin-rpcport**=*PORT* [plugin `bcli`]
+ **bitcoin-rpcport**=*PORT*
 The bitcoind(1) RPC port to connect to.
 
- **bitcoin-retry-timeout**=*SECONDS* [plugin `bcli`]
+ **bitcoin-retry-timeout**=*SECONDS*
 Number of seconds to keep trying a bitcoin-cli(1) command. If the
 command keeps failing after this time, exit with a fatal error.
 
@@ -157,10 +157,6 @@ with multiple daemons.
 Log to this file instead of stdout. Sending lightningd(8) SIGHUP will
 cause it to reopen this file (useful for log rotation).
 
- **log-timestamps**=*BOOL*
-Set this to false to turn off timestamp prefixes (they will still appear
-in crash log files).
-
  **rpc-file**=*PATH*
 Set JSON-RPC socket (or /dev/tty), such as for lightning-cli(1).
 
@@ -172,8 +168,7 @@ Set to 0660 to allow users with the same group to access the RPC
 as well.
 
  **daemon**
-Run in the background, suppress stdout and stderr.  Note that you need
-to specify **log-file** for this case.
+Run in the background, suppress stdout and stderr.
 
  **conf**=*PATH*
 Sets configuration file, and disable reading the normal general and network
@@ -193,20 +188,13 @@ The default wallet corresponds to the following DSN:
 --wallet=sqlite3://$HOME/.lightning/bitcoin/lightningd.sqlite3
 ```
 
-For the `sqlite3` scheme, you can specify a single backup database file
-by separating it with a `:` character, like so:
-
-```
---wallet=sqlite3://$HOME/.lightning/bitcoin/lightningd.sqlite3:/backup/lightningd.sqlite3
-```
-
 The following is an example of a postgresql wallet DSN:
 
 ```
 --wallet=postgres://user:pass@localhost:5432/db_name
 ```
 
-This will connect to a DB server running on `localhost` port `5432`,
+This will connect to a the DB server running on `localhost` port `5432`,
 authenticate with username `user` and password `pass`, and then use the
 database `db_name`. The database must exist, but the schema will be managed
 automatically by `lightningd`.
@@ -239,19 +227,15 @@ lightning-setchannelfee(7).
 
  **fee-per-satoshi**=*MILLIONTHS*
 Default: 10 (0.001%). This is the proportional fee to charge for every
-payment which passes through. As percentages are too coarse, it's in
+payment which passes through. As percentages are too coarse, it’s in
 millionths, so 10000 is 1%, 1000 is 0.1%. Changing this value will only
 affect new channels and not existing ones. If you want to change fees
 for existing channels, use the RPC call lightning-setchannelfee(7).
 
  **min-capacity-sat**=*SATOSHI*
 Default: 10000. This value defines the minimal effective channel
-capacity in satoshi to accept for channel opening requests. This will
-reject any opening of a channel which can't pass an HTLC of least this
-value.  Usually this prevents a peer opening a tiny channel, but it
-can also prevent a channel you open with a reasonable amount and the peer
-requesting such a large reserve that the capacity of the channel
-falls below this.
+capacity in satoshi to accept for channel opening requests. If a peer
+tries to open a channel smaller than this, the opening will be rejected.
 
  **ignore-fee-limits**=*BOOL*
 Allow nodes which establish channels to us to set any fee they want.
@@ -264,19 +248,6 @@ How long to wait before sending commitment messages to the peer: in
 theory increasing this would reduce load, but your node would have to be
 extremely busy node for you to even notice.
 
- **force-feerates**==*VALUES*
-Networks like regtest and testnet have unreliable fee estimates: we
-usually treat them as the minimum (253 sats/kw) if we can't get them.
-This allows override of one or more of our standard feerates (see
-lightning-feerates(7)).  Up to 5 values, separated by '/' can be
-provided: if fewer are provided, then the final value is used for the
-remainder.  The values are in per-kw (roughly 1/4 of bitcoind's per-kb
-values), and the order is "opening", "mutual_close", "unilateral_close",
-"delayed_to_us", "htlc_resolution", and "penalty".
-
-You would usually put this option in the per-chain config file, to avoid
-setting it on Bitcoin mainnet!  e.g. `~rusty/.lightning/regtest/config`.
-
 ### Lightning channel and HTLC options
 
  **large-channels**
@@ -288,29 +259,33 @@ is spelled **large-channels** but it's pronounced **wumbo**.
 
  **watchtime-blocks**=*BLOCKS*
 How long we need to spot an outdated close attempt: on opening a channel
-we tell our peer that this is how long they'll have to wait if they
+we tell our peer that this is how long they’ll have to wait if they
 perform a unilateral close.
 
  **max-locktime-blocks**=*BLOCKS*
 The longest our funds can be delayed (ie. the longest
 **watchtime-blocks** our peer can ask for, and also the longest HTLC
-timeout we will accept). If our peer asks for longer, we'll refuse to
-create a channel, and if an HTLC asks for longer, we'll refuse it.
+timeout we will accept). If our peer asks for longer, we’ll refuse to
+create a channel, and if an HTLC asks for longer, we’ll refuse it.
 
  **funding-confirms**=*BLOCKS*
 Confirmations required for the funding transaction when the other side
 opens a channel before the channel is usable.
 
- **commit-fee**=*PERCENT* [plugin `bcli`]
+ **commit-fee**=*PERCENT*
 The percentage of *estimatesmartfee 2/CONSERVATIVE* to use for the commitment
 transactions: default is 100.
+
+ **commit-fee-min**=*PERCENT*
+ **commit-fee-max**=*PERCENT*
+Limits on what onchain fee range we’ll allow when a node opens a channel
+with us, as a percentage of *estimatesmartfee 2*. If they’re outside
+this range, we abort their opening attempt. Note that **commit-fee-max**
+can (should!) be greater than 100.
 
  **max-concurrent-htlcs**=*INTEGER*
 Number of HTLCs one channel can handle concurrently in each direction.
 Should be between 1 and 483 (default 30).
-
- **max-dust-htlc-exposure-msat**=*MILLISATOSHI*
-Option which limits the total amount of sats to be allowed as dust on a channel.
 
  **cltv-delta**=*BLOCKS*
 The number of blocks between incoming payments and outgoing payments:
@@ -325,18 +300,18 @@ have to do that.
 
 Invoice control options:
 
- **autocleaninvoice-cycle**=*SECONDS* [plugin `autoclean`]
+ **autocleaninvoice-cycle**=*SECONDS*
 Perform cleanup of expired invoices every *SECONDS* seconds, or disable
 if 0. Usually unpaid expired invoices are uninteresting, and just take
 up space in the database.
 
- **autocleaninvoice-expired-by**=*SECONDS* [plugin `autoclean`]
+ **autocleaninvoice-expired-by**=*SECONDS*
 Control how long invoices must have been expired before they are cleaned
 (if *autocleaninvoice-cycle* is non-zero).
 
 Payment control options:
 
- **disable-mpp** [plugin `pay`]
+ **disable-mpp**
 Disable the multi-part payment sending support in the `pay` plugin. By default
 the MPP support is enabled, but it can be desirable to disable in situations
 in which each payment should result in a single HTLC being forwarded in the
@@ -345,9 +320,8 @@ network.
 ### Networking options
 
 Note that for simple setups, the implicit *autolisten* option does the
-right thing: for the mainnet (bitcoin) network it will try to bind to
-port 9735 on IPv4 and IPv6, and will announce it to peers if it seems
-like a public address.
+right thing: it will try to bind to port 9735 on IPv4 and IPv6, and will
+announce it to peers if it seems like a public address.
 
 You can instead use *addr* to override this (eg. to change the port), or
 precisely control where to bind and what to announce with the
@@ -361,31 +335,27 @@ Set an IP address (v4 or v6) or automatic Tor address to listen on and
 
 An empty 'IPADDRESS' is a special value meaning bind to IPv4 and/or
 IPv6 on all interfaces, '0.0.0.0' means bind to all IPv4
-interfaces, '::' means 'bind to all IPv6 interfaces'.
-If 'PORT' is not specified, the default port 9735 is used for mainnet
-(testnet: 19735, signet: 39735, regtest: 19846).
-If we can determine a public IP address from the resulting binding,
-the address is announced.
+interfaces, '::' means 'bind to all IPv6 interfaces'.  If 'PORT' is
+not specified, 9735 is used.  If we can determine a public IP
+address from the resulting binding, the address is announced.
 
 If the argument begins with 'autotor:' then it is followed by the
 IPv4 or IPv6 address of the Tor control port (default port 9051),
-and this will be used to configure a Tor hidden service for port 9735
-in case of mainnet (bitcoin) network whereas other networks (testnet,
-signet, regtest) will set the same default ports they use for non-Tor
-addresses (see above).
+and this will be used to configure a Tor hidden service for port 9735.
 The Tor hidden service will be configured to point to the
-first IPv4 or IPv6 address we bind to and is by default unique to
-your node's id.
+first IPv4 or IPv6 address we bind to.
 
 If the argument begins with 'statictor:' then it is followed by the
 IPv4 or IPv6 address of the Tor control port (default port 9051),
-and this will be used to configure a static Tor hidden service.
-You can add the text '/torblob=BLOB' followed by up to
+and this will be used to configure a static Tor hidden service for port 9735.
+The Tor hidden service will be configured to point to the
+first IPv4 or IPv6 address we bind to and is by default unique to
+your nodes id. You can add the text '/torblob=BLOB' followed by up to
 64 Bytes of text to generate from this text a v3 onion service
 address text unique to the first 32 Byte of this text.
 You can also use an postfix '/torport=TORPORT' to select the external
 tor binding. The result is that over tor your node is accessible by a port
-defined by you and possibly different from your local node port assignment.
+defined by you and possible different from your local node port assignment
 
 This option can be used multiple times to add more addresses, and
 its use disables autolisten.  If necessary, and 'always-use-proxy'
@@ -432,7 +402,7 @@ this to *false* disables that.
 
  **proxy**=*IPADDRESS\[:PORT\]*
 Set a socks proxy to use to connect to Tor nodes (or for all connections
-if **always-use-proxy** is set).  The port defaults to 9050 if not specified.
+if **always-use-proxy** is set).
 
  **always-use-proxy**=*BOOL*
 Always use the **proxy**, even to connect to normal IP addresses (you
@@ -441,6 +411,9 @@ all DNS lookups, to avoid leaking information.
 
  **disable-dns**
 Disable the DNS bootstrapping mechanism to find a node by its node ID.
+
+ **enable-autotor-v2-mode**
+Try to get a v2 onion address from the Tor service call, default is v3.
 
  **tor-service-password**=*PASSWORD*
 Set a Tor control password, which may be needed for *autotor:* to
@@ -457,23 +430,19 @@ additional paths too:
 
  **plugin**=*PATH*
 Specify a plugin to run as part of c-lightning. This can be specified
-multiple times to add multiple plugins.  Note that unless plugins themselves
-specify ordering requirements for being called on various hooks, plugins will
-be ordered by commandline, then config file.
+multiple times to add multiple plugins.
 
  **plugin-dir**=*DIRECTORY*
 Specify a directory to look for plugins; all executable files not
 containing punctuation (other than *.*, *-* or *\_) in 'DIRECTORY* are
 loaded. *DIRECTORY* must exist; this can be specified multiple times to
-add multiple directories.  The ordering of plugins within a directory
-is currently unspecified.
+add multiple directories.
 
  **clear-plugins**
-This option clears all *plugin*, *important-plugin*, and *plugin-dir* options
-preceeding it,
+This option clears all *plugin* and *plugin-dir* options preceeding it,
 including the default built-in plugin directory. You can still add
-*plugin-dir*, *plugin*, and *important-plugin* options following this
-and they will have the normal effect.
+*plugin-dir* and *plugin* options following this and they will have the
+normal effect.
 
  **disable-plugin**=*PLUGIN*
 If *PLUGIN* contains a /, plugins with the same path as *PLUGIN* will
@@ -481,63 +450,6 @@ not be loaded at startup. Otherwise, no plugin with that base name will
 be loaded at startup, whatever directory it is in.  This option is useful for
 disabling a single plugin inside a directory.  You can still explicitly
 load plugins which have been disabled, using lightning-plugin(7) `start`.
-
- **important-plugin**=*PLUGIN*
-Speciy a plugin to run as part of C-lightning.
-This can be specified multiple times to add multiple plugins.
-Plugins specified via this option are considered so important, that if the
-plugin stops for any reason (including via lightning-plugin(7) `stop`),
-C-lightning will also stop running.
-This way, you can monitor crashes of important plugins by simply monitoring
-if C-lightning terminates.
-Built-in plugins, which are installed with lightningd(8), are automatically
-considered important.
-
-### Experimental Options
-
-Experimental options are subject to breakage between releases: they
-are made available for advanced users who want to test proposed
-features.  If lightningd is built configured with
-`--enable-experimental-features` these are on by default.
-
- **experimental-onion-messages**
-
-Specifying this enables sending, forwarding and receiving onion messages,
-which are in draft status in the BOLT specifications.
-
- **experimental-offers**
-
-Specifying this enables the `offers` and `fetchinvoice` plugins and
-corresponding functionality, which are in draft status as BOLT12.
-This usually requires **experimental-onion-messages** as well.  See
-lightning-offer(7) and lightning-fetchinvoice(7).
-
- **fetchinvoice-noconnect**
-
-Specifying this prevents `fetchinvoice` and `sendinvoice` from
-trying to connect directly to the offering node as a last resort.
-
- **experimental-shutdown-wrong-funding**
-
-Specifying this allows the `wrong_funding` field in shutdown: if a
-remote node has opened a channel but claims it used the incorrect txid
-(and the channel hasn't been used yet at all) this allows them to
-negotiate a clean shutdown with the txid they offer.
-
- **experimental-dual-fund**
-
-Specifying this enables support for the dual funding protocol,
-allowing both parties to contribute funds to a channel. The decision
-about whether to add funds or not to a proposed channel is handled
-automatically by a plugin that implements the appropriate logic for
-your needs. The default behavior is to not contribute funds.
-
- **experimental-websocket-port**=*PORT*
-
-Specifying this enables support for accepting incoming WebSocket
-connections on that port, on any IPv4 and IPv6 addresses you listen
-to.  The normal protocol is expected to be sent over WebSocket binary
-frames once the connection is upgraded.
 
 BUGS
 ----
@@ -548,7 +460,7 @@ to gain our eternal gratitude!
 AUTHOR
 ------
 
-Rusty Russell <<rusty@rustcorp.com.au>> wrote this man page, and
+Rusty Russell &lt;<rusty@rustcorp.com.au>&gt; wrote this man page, and
 much of the configuration language, but many others did the hard work of
 actually implementing these options.
 
